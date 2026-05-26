@@ -116,6 +116,17 @@ class GPSGenerator:
         )
         return f"${body}*{nmea_checksum(body)}"
 
+    def generate_zda(self) -> str:
+        """Generate GPZDA sentence with full UTC date/time (4-digit year)."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        time_str = now.strftime("%H%M%S.00")
+        body = (
+            f"GPZDA,{time_str},"
+            f"{now.day:02d},{now.month:02d},{now.year:04d},"
+            f"00,00"
+        )
+        return f"${body}*{nmea_checksum(body)}"
+
     def reset_position(self, lat: float, lon: float) -> None:
         """Snap own-ship to a new position without movement history."""
         self.lat = lat
