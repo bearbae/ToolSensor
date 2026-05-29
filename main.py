@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from generators import AISGenerator, GPSGenerator, RadarTTMGenerator
+from generators import AISGenerator, GPSGenerator, RadarTTMGenerator, _latlon_from_bearing_range
 from transmitters import (
     SerialTransmitter,
     TCPTransmitter,
@@ -107,6 +107,7 @@ class MainWindow(QMainWindow):
 
         self._transmitter = None
         self._thread: TransmitterThread | None = None
+        self._fusion_entries: list = []
 
         self._gps_display_timer = QTimer(self)
         self._gps_display_timer.setInterval(500)
@@ -496,8 +497,54 @@ class MainWindow(QMainWindow):
         at_layout.addWidget(self._ais_list)
         tabs.addTab(ais_tab, "AIS  (VDM)")
 
+        # ---- Fusion Test tab ---------------------------------------------
+        tabs.addTab(self._build_fusion_tab(), "Fusion Test")
+
         layout.addWidget(tabs)
         return group
+
+    def _build_fusion_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        form = QFormLayout()
+
+        self._f_fused_count = QSpinBox()
+        self._f_fused_count.setRange(1, 30)
+        self._f_fused_count.setValue(3)
+        self._f_fused_count.setSuffix("  cặp")
+
+        self._f_radar_only_count = QSpinBox()
+        self._f_radar_only_count.setRange(0, 20)
+        self._f_radar_only_count.setValue(2)
+        self._f_radar_only_count.setSuffix("  targets")
+
+        self._f_ais_only_count = QSpinBox()
+        self._f_ais_only_count.setRange(0, 20)
+        self._f_ais_only_count.setValue(2)
+        self._f_ais_only_count.setSuffix("  vessels")
+
+        self._f_mid = QComboBox()
+        self._f_mid.addItem("Mix (random countries)")
+        self._f_mid.addItems(self._MID_TABLE.keys())
+
+        form.addRow("Fused (Radar + AIS):", self._f_fused_count)
+        form.addRow("Radar-only:", self._f_radar_only_count)
+        form.addRow("AIS-only:", self._f_ais_only_count)
+        form.addRow("MMSI Country:", self._f_mid)
+        layout.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        self._btn_fusion_generate = QPushButton("Generate Fusion Scenario")
+        self._btn_fusion_clear = QPushButton("Clear All")
+        btn_row.addWidget(self._btn_fusion_generate)
+        btn_row.addWidget(self._btn_fusion_clear)
+        layout.addLayout(btn_row)
+
+        self._fusion_list = QListWidget()
+        layout.addWidget(self._fusion_list)
+
+        return tab
 
     # --- Log console ------------------------------------------------------
 
@@ -577,6 +624,10 @@ class MainWindow(QMainWindow):
         self._btn_a_auto.clicked.connect(self._on_ais_auto_generate)
         self._btn_a_clear.clicked.connect(self._on_ais_clear)
         self._ais_list.itemClicked.connect(self._on_ais_item_clicked)
+
+        # Fusion test
+        self._btn_fusion_generate.clicked.connect(self._on_fusion_generate)
+        self._btn_fusion_clear.clicked.connect(self._on_fusion_clear)
 
         # Log
         self._btn_clear.clicked.connect(self._log.clear)
@@ -718,6 +769,7 @@ class MainWindow(QMainWindow):
             name=self._r_name.text().strip(),
         )
         self._refresh_radar_list()
+        self._refresh_fusion_list()
 
     def _on_radar_remove(self) -> None:
         items = self._radar_list.selectedItems()
@@ -725,6 +777,7 @@ class MainWindow(QMainWindow):
             tid = int(items[0].text().split(':')[0].strip())
             self._radar_gen.remove_target(tid)
             self._refresh_radar_list()
+            self._refresh_fusion_list()
 
     def _on_radar_item_clicked(self, item) -> None:
         tid = int(item.text().split(':')[0].strip())
@@ -767,16 +820,10 @@ class MainWindow(QMainWindow):
     def _on_ais_auto_generate(self) -> None:
         import random
         count = self._a_auto_count.value()
-        existing = set(self._ais_gen.vessels.keys())
-        base_mmsi = 100_000_001
         ship_types = [30, 36, 52, 60, 70, 80, 90]
         for _ in range(count):
-            mmsi = base_mmsi
-            while mmsi in existing:
-                mmsi += 1
-            existing.add(mmsi)
+            mmsi = self._new_mmsi(mid=0)   # random country each vessel
             idx = len(self._ais_gen.vessels) + 1
-            # Random position within ~10 NM of own ship
             lat = self._gps_gen.lat + random.uniform(-0.15, 0.15)
             lon = self._gps_gen.lon + random.uniform(-0.15, 0.15)
             self._ais_gen.add_or_update_vessel(
@@ -789,7 +836,7 @@ class MainWindow(QMainWindow):
                 nav_status=0,
                 shipname=f'VESSEL {idx:02d}',
                 shiptype=random.choice(ship_types),
-                callsign=f'V{mmsi % 100000:05d}',
+                callsign=f'{mmsi // 1_000_000:03d}{mmsi % 1_000:03d}',
             )
         self._refresh_ais_list()
 
@@ -818,8 +865,20 @@ class MainWindow(QMainWindow):
         else:
             eta = (0, 0, 24, 60)   # not available
 
+        new_mmsi = int(self._a_mmsi.text())
+        old_mmsi = getattr(self, '_a_last_loaded_mmsi', None)
+
+        # Nếu user đổi MMSI của một vessel đang có trong fusion entry → cập nhật entry + xóa vessel cũ
+        if old_mmsi is not None and old_mmsi != new_mmsi:
+            for e in self._fusion_entries:
+                if e.get('mmsi') == old_mmsi:
+                    e['mmsi'] = new_mmsi
+                    self._ais_gen.vessels.pop(old_mmsi, None)
+                    break
+        self._a_last_loaded_mmsi = new_mmsi
+
         self._ais_gen.add_or_update_vessel(
-            mmsi=int(self._a_mmsi.text()),
+            mmsi=new_mmsi,
             lat=self._a_lat.value(),
             lon=self._a_lon.value(),
             sog=self._a_sog.value(),
@@ -833,6 +892,7 @@ class MainWindow(QMainWindow):
             eta=eta,
         )
         self._refresh_ais_list()
+        self._refresh_fusion_list()
 
     def _on_ais_remove(self) -> None:
         items = self._ais_list.selectedItems()
@@ -840,12 +900,14 @@ class MainWindow(QMainWindow):
             mmsi = int(items[0].text().split()[0])
             self._ais_gen.remove_vessel(mmsi)
             self._refresh_ais_list()
+            self._refresh_fusion_list()
 
     def _on_ais_item_clicked(self, item) -> None:
         mmsi = int(item.text().split()[0])
         v = self._ais_gen.vessels.get(mmsi)
         if not v:
             return
+        self._a_last_loaded_mmsi = mmsi   # track để detect đổi MMSI
         self._a_mmsi.setText(str(mmsi))
         self._a_shipname.setText(v.get('shipname', ''))
         self._a_callsign.setText(v.get('callsign', ''))
@@ -911,6 +973,191 @@ class MainWindow(QMainWindow):
                     self._a_lon.setValue(v['lon'])
                     self._a_lat.blockSignals(False)
                     self._a_lon.blockSignals(False)
+
+    # Fusion test scenario ------------------------------------------------
+
+    # ITU-R M.585 Maritime Identification Digits
+    _MID_TABLE: dict[str, int] = {
+        "Vietnam (574)":      574,
+        "China (413)":        413,
+        "Japan (431)":        431,
+        "South Korea (440)":  440,
+        "Singapore (563)":    563,
+        "Malaysia (533)":     533,
+        "Philippines (548)":  548,
+        "Indonesia (525)":    525,
+        "Thailand (567)":     567,
+        "Hong Kong (477)":    477,
+        "USA (338)":          338,
+        "UK (235)":           235,
+        "Australia (503)":    503,
+        "India (419)":        419,
+    }
+
+    def _new_mmsi(self, mid: int | None = None) -> int:
+        """Return a unique, standards-compliant MMSI (MID × 10⁶ + 6-digit suffix).
+
+        mid=None → read from the Fusion Test combo (Mix = random country each call).
+        mid=0    → pick a random country from _MID_TABLE.
+        mid=N    → use that MID directly.
+        """
+        import random
+        if mid is None:
+            sel = self._f_mid.currentText()
+            mid = random.choice(list(self._MID_TABLE.values())) if sel.startswith("Mix") \
+                else self._MID_TABLE.get(sel, 574)
+        elif mid == 0:
+            mid = random.choice(list(self._MID_TABLE.values()))
+        existing = set(self._ais_gen.vessels)
+        for _ in range(10_000):
+            mmsi = mid * 1_000_000 + random.randint(0, 999_999)
+            if mmsi not in existing:
+                return mmsi
+        raise RuntimeError("Cannot generate a unique MMSI")
+
+    def _on_fusion_generate(self) -> None:
+        import random
+        self._radar_gen.targets.clear()
+        self._ais_gen.vessels.clear()
+        self._fusion_entries = []
+
+        fused_count = self._f_fused_count.value()
+        radar_only_count = self._f_radar_only_count.value()
+        ais_only_count = self._f_ais_only_count.value()
+
+        ship_types = [30, 36, 52, 60, 70, 80, 90]
+        tid = 1
+
+        for i in range(fused_count):
+            mmsi = self._new_mmsi()
+            bearing = round(random.uniform(0, 360), 1)
+            range_nm = round(random.uniform(0.5, 10.0), 2)
+            speed = round(random.uniform(2, 18), 1)
+            course = round(random.uniform(0, 360), 1)
+            name = f'FUS{i + 1:02d}'
+
+            self._radar_gen.add_or_update_target(
+                target_id=tid,
+                bearing=bearing,
+                range_nm=range_nm,
+                speed=speed,
+                course=course,
+                status='T',
+                name=name,
+            )
+            lat, lon = _latlon_from_bearing_range(
+                self._gps_gen.lat, self._gps_gen.lon, bearing, range_nm
+            )
+            self._ais_gen.add_or_update_vessel(
+                mmsi=mmsi,
+                lat=round(lat, 6),
+                lon=round(lon, 6),
+                sog=speed,
+                cog=course,
+                heading=int(course) % 360,
+                nav_status=0,
+                shipname=name,
+                shiptype=random.choice(ship_types),
+                callsign=f'{mmsi // 1_000_000:03d}{mmsi % 1_000:03d}',
+            )
+            self._fusion_entries.append({'type': 'FUSED', 'tid': tid, 'mmsi': mmsi})
+            tid += 1
+
+        for i in range(radar_only_count):
+            bearing = round(random.uniform(0, 360), 1)
+            range_nm = round(random.uniform(0.5, 10.0), 2)
+            speed = round(random.uniform(0, 20), 1)
+            course = round(random.uniform(0, 360), 1)
+            self._radar_gen.add_or_update_target(
+                target_id=tid,
+                bearing=bearing,
+                range_nm=range_nm,
+                speed=speed,
+                course=course,
+                status='T',
+                name=f'RDR{tid:02d}',
+            )
+            self._fusion_entries.append({'type': 'RADAR', 'tid': tid})
+            tid += 1
+
+        for i in range(ais_only_count):
+            mmsi = self._new_mmsi()
+            lat = round(self._gps_gen.lat + random.uniform(-0.2, 0.2), 6)
+            lon = round(self._gps_gen.lon + random.uniform(-0.2, 0.2), 6)
+            sog = round(random.uniform(0, 18), 1)
+            cog = round(random.uniform(0, 360), 1)
+            self._ais_gen.add_or_update_vessel(
+                mmsi=mmsi,
+                lat=lat,
+                lon=lon,
+                sog=sog,
+                cog=cog,
+                heading=511,
+                nav_status=0,
+                shipname=f'AIS{i + 1:02d}',
+                shiptype=random.choice(ship_types),
+                callsign=f'{mmsi // 1_000_000:03d}{mmsi % 1_000:03d}',
+            )
+            self._fusion_entries.append({'type': 'AIS', 'mmsi': mmsi})
+
+        self._refresh_radar_list()
+        self._refresh_ais_list()
+        self._refresh_fusion_list()
+        self._log_info(
+            f"Fusion scenario: {fused_count} fused, "
+            f"{radar_only_count} radar-only, {ais_only_count} AIS-only"
+        )
+
+    def _on_fusion_clear(self) -> None:
+        self._radar_gen.targets.clear()
+        self._ais_gen.vessels.clear()
+        self._fusion_entries = []
+        self._refresh_radar_list()
+        self._refresh_ais_list()
+        self._refresh_fusion_list()
+
+    def _refresh_fusion_list(self) -> None:
+        self._fusion_list.clear()
+        for e in self._fusion_entries:
+            if e['type'] == 'FUSED':
+                t = self._radar_gen.targets.get(e['tid'])
+                v = self._ais_gen.vessels.get(e['mmsi'])
+                if t and v:
+                    self._fusion_list.addItem(
+                        f"[FUSED] Radar={e['tid']:02d} ↔ MMSI={e['mmsi']}  "
+                        f"Brg={t['bearing']:5.1f}°  Rng={t['range']:4.2f} NM  "
+                        f"Spd={t['speed']:4.1f} kn  Crs={t['course']:5.1f}°"
+                    )
+                else:
+                    missing = []
+                    if not t:
+                        missing.append(f"Radar={e['tid']:02d}")
+                    if not v:
+                        missing.append(f"MMSI={e['mmsi']}")
+                    self._fusion_list.addItem(
+                        f"[FUSED] Radar={e['tid']:02d} ↔ MMSI={e['mmsi']}  "
+                        f"[MISSING: {', '.join(missing)}]"
+                    )
+            elif e['type'] == 'RADAR':
+                t = self._radar_gen.targets.get(e['tid'])
+                if t:
+                    self._fusion_list.addItem(
+                        f"[RADAR] ID={e['tid']:02d}  "
+                        f"Brg={t['bearing']:5.1f}°  Rng={t['range']:4.2f} NM  "
+                        f"Spd={t['speed']:4.1f} kn  Crs={t['course']:5.1f}°"
+                    )
+                else:
+                    self._fusion_list.addItem(f"[RADAR] ID={e['tid']:02d}  [MISSING]")
+            else:
+                v = self._ais_gen.vessels.get(e['mmsi'])
+                if v:
+                    self._fusion_list.addItem(
+                        f"[AIS  ] MMSI={e['mmsi']}  "
+                        f"Lat={v['lat']:.6f}  Lon={v['lon']:.6f}  "
+                        f"SOG={v['sog']:4.1f} kn  COG={v['cog']:5.1f}°"
+                    )
+                else:
+                    self._fusion_list.addItem(f"[AIS  ] MMSI={e['mmsi']}  [MISSING]")
 
     # Cleanup -------------------------------------------------------------
 
