@@ -1,6 +1,7 @@
 """TCP and Serial transmitters, plus a QThread-based sender."""
 
 import socket
+import threading
 import time
 
 import serial
@@ -27,6 +28,63 @@ class TCPTransmitter:
         self._sock.sendall((data + '\r\n').encode('ascii'))
 
     def close(self) -> None:
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+
+class TCPServerTransmitter:
+    """Listens as a TCP server; broadcasts NMEA sentences to all connected clients."""
+
+    def __init__(self, host: str, port: int):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind((host, port))
+        self._sock.listen(10)
+        self._sock.settimeout(0.5)
+        self._clients: list = []
+        self._lock = threading.Lock()
+        self._running = True
+        self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._accept_thread.start()
+
+    def _accept_loop(self) -> None:
+        while self._running:
+            try:
+                conn, _ = self._sock.accept()
+                conn.settimeout(2.0)
+                with self._lock:
+                    self._clients.append(conn)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+    def send(self, data: str) -> None:
+        dead = []
+        with self._lock:
+            for client in self._clients:
+                try:
+                    client.sendall((data + '\r\n').encode('ascii'))
+                except Exception:
+                    dead.append(client)
+            for d in dead:
+                self._clients.remove(d)
+
+    def client_count(self) -> int:
+        with self._lock:
+            return len(self._clients)
+
+    def close(self) -> None:
+        self._running = False
+        with self._lock:
+            for client in self._clients:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            self._clients.clear()
         try:
             self._sock.close()
         except Exception:

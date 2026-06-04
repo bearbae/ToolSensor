@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
 from generators import AISGenerator, GPSGenerator, RadarTTMGenerator, _latlon_from_bearing_range
 from transmitters import (
     SerialTransmitter,
+    TCPServerTransmitter,
     TCPTransmitter,
     TransmitterThread,
     list_serial_ports,
@@ -158,17 +159,19 @@ class MainWindow(QMainWindow):
         # Mode radio buttons
         mode_row = QHBoxLayout()
         self._rb_tcp = QRadioButton("TCP Client")
+        self._rb_tcp_server = QRadioButton("TCP Server")
         self._rb_serial = QRadioButton("Serial Port")
         self._rb_tcp.setChecked(True)
         self._mode_grp = QButtonGroup(self)
         self._mode_grp.addButton(self._rb_tcp)
+        self._mode_grp.addButton(self._rb_tcp_server)
         self._mode_grp.addButton(self._rb_serial)
         mode_row.addWidget(self._rb_tcp)
+        mode_row.addWidget(self._rb_tcp_server)
         mode_row.addWidget(self._rb_serial)
-        mode_row.addStretch()
         layout.addLayout(mode_row)
 
-        # TCP sub-panel
+        # TCP Client sub-panel
         self._tcp_widget = QWidget()
         tcp_form = QFormLayout(self._tcp_widget)
         tcp_form.setContentsMargins(0, 0, 0, 0)
@@ -179,6 +182,22 @@ class MainWindow(QMainWindow):
         tcp_form.addRow("Host:", self._tcp_host)
         tcp_form.addRow("Port:", self._tcp_port)
         layout.addWidget(self._tcp_widget)
+
+        # TCP Server sub-panel
+        self._tcp_server_widget = QWidget()
+        srv_form = QFormLayout(self._tcp_server_widget)
+        srv_form.setContentsMargins(0, 0, 0, 0)
+        self._srv_host = QLineEdit("0.0.0.0")
+        self._srv_port = QSpinBox()
+        self._srv_port.setRange(1, 65535)
+        self._srv_port.setValue(10110)
+        self._lbl_clients = QLabel("0 clients connected")
+        self._lbl_clients.setStyleSheet("color: #0d6efd; font-weight: bold;")
+        srv_form.addRow("Bind IP:", self._srv_host)
+        srv_form.addRow("Port:", self._srv_port)
+        srv_form.addRow("", self._lbl_clients)
+        self._tcp_server_widget.setVisible(False)
+        layout.addWidget(self._tcp_server_widget)
 
         # Serial sub-panel
         self._serial_widget = QWidget()
@@ -426,6 +445,18 @@ class MainWindow(QMainWindow):
             "15 – Not defined",
         ])
 
+        self._a_ais_class = QComboBox()
+        self._a_ais_class.addItems(["Class A  (Type 1 + Type 5)", "Class B  (Type 18 + Type 24)"])
+
+        self._a_imo = QSpinBox()
+        self._a_imo.setRange(0, 9_999_999)
+        self._a_imo.setValue(0)
+        self._a_imo.setToolTip("IMO number (1000000–9999999). 0 = not available.\nClass B vessels do not transmit IMO.")
+
+        self._a_ais_class.currentIndexChanged.connect(
+            lambda i: self._a_imo.setEnabled(i == 0)
+        )
+
         self._a_shipname = QLineEdit()
         self._a_shipname.setPlaceholderText("Max 20 chars")
         self._a_shipname.setMaxLength(20)
@@ -458,6 +489,8 @@ class MainWindow(QMainWindow):
         eta_row.addWidget(self._a_eta, stretch=1)
 
         at_form.addRow("MMSI:", self._a_mmsi)
+        at_form.addRow("AIS Class:", self._a_ais_class)
+        at_form.addRow("IMO Number:", self._a_imo)
         at_form.addRow("Ship Name:", self._a_shipname)
         at_form.addRow("Call Sign:", self._a_callsign)
         at_form.addRow("Ship Type:", self._a_shiptype)
@@ -580,6 +613,7 @@ class MainWindow(QMainWindow):
     def _wire_signals(self) -> None:
         # Mode toggle
         self._rb_tcp.toggled.connect(self._on_mode_changed)
+        self._rb_tcp_server.toggled.connect(self._on_mode_changed)
 
         # Serial refresh
         self._btn_refresh.clicked.connect(self._refresh_ports)
@@ -638,6 +672,7 @@ class MainWindow(QMainWindow):
 
     def _on_mode_changed(self) -> None:
         self._tcp_widget.setVisible(self._rb_tcp.isChecked())
+        self._tcp_server_widget.setVisible(self._rb_tcp_server.isChecked())
         self._serial_widget.setVisible(self._rb_serial.isChecked())
 
     def _refresh_ports(self) -> None:
@@ -656,7 +691,12 @@ class MainWindow(QMainWindow):
                 host = self._tcp_host.text().strip()
                 port = self._tcp_port.value()
                 self._transmitter = TCPTransmitter(host, port)
-                label = f"TCP  {host}:{port}"
+                label = f"TCP Client  {host}:{port}"
+            elif self._rb_tcp_server.isChecked():
+                host = self._srv_host.text().strip()
+                port = self._srv_port.value()
+                self._transmitter = TCPServerTransmitter(host, port)
+                label = f"TCP Server  {host}:{port}"
             else:
                 port_name = self._serial_port.currentText()
                 baud = int(self._serial_baud.currentText())
@@ -670,7 +710,7 @@ class MainWindow(QMainWindow):
             self._btn_disconnect.setEnabled(True)
             self._btn_start.setEnabled(True)
             self.statusBar().showMessage(f"Connected — {label}")
-            self._log_info(f"Connected to {label}")
+            self._log_info(f"Connected: {label}")
 
         except Exception as exc:
             QMessageBox.critical(self, "Connection Error", str(exc))
@@ -817,15 +857,23 @@ class MainWindow(QMainWindow):
         self._radar_gen.targets.clear()
         self._refresh_radar_list()
 
+    # Ship types that require Class A transponder (large commercial vessels)
+    _CLASS_A_TYPES = {52, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69,
+                      70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
+                      80, 81, 82, 83, 84, 85, 86, 87, 88, 89}
+
     def _on_ais_auto_generate(self) -> None:
         import random
         count = self._a_auto_count.value()
         ship_types = [30, 36, 52, 60, 70, 80, 90]
         for _ in range(count):
-            mmsi = self._new_mmsi(mid=0)   # random country each vessel
+            shiptype = random.choice(ship_types)
+            ais_class = 'A' if shiptype in self._CLASS_A_TYPES else 'B'
+            mmsi = self._new_mmsi(mid=0)
             idx = len(self._ais_gen.vessels) + 1
             lat = self._gps_gen.lat + random.uniform(-0.15, 0.15)
             lon = self._gps_gen.lon + random.uniform(-0.15, 0.15)
+            imo = random.randint(1_000_000, 9_999_999) if ais_class == 'A' else 0
             self._ais_gen.add_or_update_vessel(
                 mmsi=mmsi,
                 lat=round(lat, 6),
@@ -835,8 +883,10 @@ class MainWindow(QMainWindow):
                 heading=random.randint(0, 359),
                 nav_status=0,
                 shipname=f'VESSEL {idx:02d}',
-                shiptype=random.choice(ship_types),
+                shiptype=shiptype,
                 callsign=f'{mmsi // 1_000_000:03d}{mmsi % 1_000:03d}',
+                imo=imo,
+                ais_class=ais_class,
             )
         self._refresh_ais_list()
 
@@ -877,6 +927,7 @@ class MainWindow(QMainWindow):
                     break
         self._a_last_loaded_mmsi = new_mmsi
 
+        ais_class = 'A' if self._a_ais_class.currentIndex() == 0 else 'B'
         self._ais_gen.add_or_update_vessel(
             mmsi=new_mmsi,
             lat=self._a_lat.value(),
@@ -890,6 +941,8 @@ class MainWindow(QMainWindow):
             callsign=self._a_callsign.text().strip(),
             destination=self._a_destination.text().strip(),
             eta=eta,
+            imo=self._a_imo.value() if ais_class == 'A' else 0,
+            ais_class=ais_class,
         )
         self._refresh_ais_list()
         self._refresh_fusion_list()
@@ -909,6 +962,9 @@ class MainWindow(QMainWindow):
             return
         self._a_last_loaded_mmsi = mmsi   # track để detect đổi MMSI
         self._a_mmsi.setText(str(mmsi))
+        cls = v.get('ais_class', 'A')
+        self._a_ais_class.setCurrentIndex(0 if cls == 'A' else 1)
+        self._a_imo.setValue(v.get('imo', 0))
         self._a_shipname.setText(v.get('shipname', ''))
         self._a_callsign.setText(v.get('callsign', ''))
         self._a_destination.setText(v.get('destination', ''))
@@ -931,8 +987,9 @@ class MainWindow(QMainWindow):
         self._ais_list.clear()
         for mmsi, v in self._ais_gen.vessels.items():
             name = v.get('shipname', '') or '—'
+            cls = v.get('ais_class', 'A')
             self._ais_list.addItem(
-                f"{mmsi}  [{name}]  "
+                f"{mmsi}  [{name}]  Cls={cls}  "
                 f"Lat={v['lat']:10.6f}  Lon={v['lon']:11.6f}  "
                 f"SOG={v['sog']:5.1f} kn  COG={v['cog']:6.1f}°"
             )
@@ -940,7 +997,14 @@ class MainWindow(QMainWindow):
     # GPS live display ----------------------------------------------------
 
     def _update_gps_display(self) -> None:
-        """Refresh GPS spinboxes and AIS list from generators without triggering signals."""
+        """Refresh GPS spinboxes, AIS list, and TCP Server client count."""
+        # TCP Server client count
+        if isinstance(self._transmitter, TCPServerTransmitter):
+            n = self._transmitter.client_count()
+            self._lbl_clients.setText(
+                f"{n} client{'s' if n != 1 else ''} connected"
+            )
+
         # GPS spinboxes
         self._gps_lat.blockSignals(True)
         self._gps_lon.blockSignals(True)
@@ -1025,7 +1089,6 @@ class MainWindow(QMainWindow):
         radar_only_count = self._f_radar_only_count.value()
         ais_only_count = self._f_ais_only_count.value()
 
-        ship_types = [30, 36, 52, 60, 70, 80, 90]
         tid = 1
 
         for i in range(fused_count):
@@ -1048,6 +1111,8 @@ class MainWindow(QMainWindow):
             lat, lon = _latlon_from_bearing_range(
                 self._gps_gen.lat, self._gps_gen.lon, bearing, range_nm
             )
+            # Fused vessels are large commercial ships → always Class A with IMO
+            fused_shiptype = random.choice([70, 71, 72, 73, 74, 80, 81, 82, 83, 84])
             self._ais_gen.add_or_update_vessel(
                 mmsi=mmsi,
                 lat=round(lat, 6),
@@ -1057,8 +1122,10 @@ class MainWindow(QMainWindow):
                 heading=int(course) % 360,
                 nav_status=0,
                 shipname=name,
-                shiptype=random.choice(ship_types),
+                shiptype=fused_shiptype,
                 callsign=f'{mmsi // 1_000_000:03d}{mmsi % 1_000:03d}',
+                imo=random.randint(1_000_000, 9_999_999),
+                ais_class='A',
             )
             self._fusion_entries.append({'type': 'FUSED', 'tid': tid, 'mmsi': mmsi})
             tid += 1
@@ -1086,6 +1153,9 @@ class MainWindow(QMainWindow):
             lon = round(self._gps_gen.lon + random.uniform(-0.2, 0.2), 6)
             sog = round(random.uniform(0, 18), 1)
             cog = round(random.uniform(0, 360), 1)
+            # AIS-only: mix Class A and B (small vessels, fishing, sailing)
+            ao_shiptype = random.choice([30, 36, 37, 52, 90])
+            ao_class = 'A' if ao_shiptype in self._CLASS_A_TYPES else 'B'
             self._ais_gen.add_or_update_vessel(
                 mmsi=mmsi,
                 lat=lat,
@@ -1095,8 +1165,10 @@ class MainWindow(QMainWindow):
                 heading=511,
                 nav_status=0,
                 shipname=f'AIS{i + 1:02d}',
-                shiptype=random.choice(ship_types),
+                shiptype=ao_shiptype,
                 callsign=f'{mmsi // 1_000_000:03d}{mmsi % 1_000:03d}',
+                imo=random.randint(1_000_000, 9_999_999) if ao_class == 'A' else 0,
+                ais_class=ao_class,
             )
             self._fusion_entries.append({'type': 'AIS', 'mmsi': mmsi})
 

@@ -203,11 +203,19 @@ class RadarTTMGenerator:
 # ---------------------------------------------------------------------------
 
 class AISGenerator:
-    """Generates AIVDM Type-1 sentences. Vessel positions advance each call."""
+    """Generates AIVDM sentences (Type 1/5 for Class A, Type 18/24 for Class B).
+
+    Position reports are emitted every call.
+    Static data (Type 5 / Type 24) follows ITU-R M.1371-5: sent immediately on
+    first appearance, then at most once every STATIC_INTERVAL seconds (360 s = 6 min).
+    """
+
+    STATIC_INTERVAL = 360.0   # seconds between static-data transmissions
 
     def __init__(self):
         self.vessels: dict = {}   # mmsi -> dict
         self._last_t = time.monotonic()
+        self._seq_id = 0          # sequential message identifier for multi-sentence messages
 
     def add_or_update_vessel(
         self,
@@ -223,6 +231,8 @@ class AISGenerator:
         callsign: str = '',
         destination: str = '',
         eta: tuple = (0, 0, 24, 60),   # (month, day, hour, minute) — 0/24/60 = n/a
+        imo: int = 0,                  # IMO number 1000000–9999999; 0 = not available
+        ais_class: str = 'A',          # 'A' → Type 1+5;  'B' → Type 18+24A+24B
     ) -> None:
         self.vessels[mmsi] = {
             'lat': lat,
@@ -236,6 +246,8 @@ class AISGenerator:
             'callsign': callsign,
             'destination': destination,
             'eta': eta,
+            'imo': imo,
+            'ais_class': ais_class,
         }
 
     def remove_vessel(self, mmsi: int) -> None:
@@ -254,7 +266,7 @@ class AISGenerator:
         add_uint(0, 2)                                              # Repeat
         add_uint(mmsi, 30)                                          # MMSI
         add_uint(0, 2)                                              # AIS version
-        add_uint(0, 30)                                             # IMO number
+        add_uint(vessel.get('imo', 0), 30)                          # IMO number
         bits.extend(_encode_ais_text(vessel.get('callsign', ''), 7))   # Call sign (42 bits)
         bits.extend(_encode_ais_text(vessel.get('shipname', ''), 20))  # Ship name (120 bits)
         add_uint(vessel.get('shiptype', 0), 8)                     # Ship & cargo type
@@ -297,8 +309,8 @@ class AISGenerator:
         add_int(-128, 8)                                        # ROT (n/a)
         add_uint(int(vessel['sog'] * 10), 10)                   # SOG ×10
         add_uint(0, 1)                                          # Pos accuracy
-        add_int(int(vessel['lon'] * 600000), 28)                # Lon (1/10000 min)
-        add_int(int(vessel['lat'] * 600000), 27)                # Lat (1/10000 min)
+        add_int(round(vessel['lon'] * 600000), 28)              # Lon (1/10000 min)
+        add_int(round(vessel['lat'] * 600000), 27)              # Lat (1/10000 min)
         add_uint(int(vessel['cog'] * 10), 12)                   # COG ×10
         add_uint(vessel['heading'], 9)                          # Heading
         add_uint(datetime.datetime.now(datetime.timezone.utc).second, 6)  # UTC second
@@ -307,6 +319,86 @@ class AISGenerator:
         add_uint(0, 1)                                          # RAIM
         add_uint(0, 19)                                         # Radio status
         return bits                                             # 168 bits
+
+    def _build_type18_bits(self, mmsi: int, vessel: dict) -> list:
+        """Build 168-bit AIS Type 18 (Class B position report)."""
+        bits = []
+
+        def add_uint(value: int, n: int) -> None:
+            value = int(value) & ((1 << n) - 1)
+            for i in range(n - 1, -1, -1):
+                bits.append((value >> i) & 1)
+
+        def add_int(value: int, n: int) -> None:
+            value = int(value)
+            if value < 0:
+                value += (1 << n)
+            value &= (1 << n) - 1
+            for i in range(n - 1, -1, -1):
+                bits.append((value >> i) & 1)
+
+        add_uint(18, 6)                                                  # Message type
+        add_uint(0, 2)                                                   # Repeat
+        add_uint(mmsi, 30)                                               # MMSI
+        add_uint(0, 8)                                                   # Reserved
+        add_uint(int(vessel['sog'] * 10), 10)                            # SOG ×10
+        add_uint(0, 1)                                                   # Pos accuracy
+        add_int(round(vessel['lon'] * 600000), 28)                       # Lon (1/10000 min)
+        add_int(round(vessel['lat'] * 600000), 27)                       # Lat (1/10000 min)
+        add_uint(int(vessel['cog'] * 10), 12)                            # COG ×10
+        add_uint(vessel['heading'], 9)                                   # Heading
+        add_uint(datetime.datetime.now(datetime.timezone.utc).second, 6) # UTC second
+        add_uint(0, 2)                                                   # Regional reserved
+        add_uint(1, 1)                                                   # CS Unit = 1 (Class B CS)
+        add_uint(0, 1)                                                   # Display flag
+        add_uint(1, 1)                                                   # DSC flag
+        add_uint(1, 1)                                                   # Band flag
+        add_uint(1, 1)                                                   # MSG22 flag
+        add_uint(0, 1)                                                   # Assigned
+        add_uint(0, 1)                                                   # RAIM
+        add_uint(0, 20)                                                  # Radio status
+        return bits                                                      # 168 bits
+
+    def _build_type24a_bits(self, mmsi: int, vessel: dict) -> list:
+        """Build 168-bit AIS Type 24 Part A (Class B static — ship name)."""
+        bits = []
+
+        def add_uint(value: int, n: int) -> None:
+            value = int(value) & ((1 << n) - 1)
+            for i in range(n - 1, -1, -1):
+                bits.append((value >> i) & 1)
+
+        add_uint(24, 6)                                                  # Message type
+        add_uint(0, 2)                                                   # Repeat
+        add_uint(mmsi, 30)                                               # MMSI
+        add_uint(0, 2)                                                   # Part number = 0
+        bits.extend(_encode_ais_text(vessel.get('shipname', ''), 20))    # Ship name (120 bits)
+        add_uint(0, 8)                                                   # Spare
+        return bits                                                      # 168 bits
+
+    def _build_type24b_bits(self, mmsi: int, vessel: dict) -> list:
+        """Build 168-bit AIS Type 24 Part B (Class B static — callsign, shiptype)."""
+        bits = []
+
+        def add_uint(value: int, n: int) -> None:
+            value = int(value) & ((1 << n) - 1)
+            for i in range(n - 1, -1, -1):
+                bits.append((value >> i) & 1)
+
+        add_uint(24, 6)                                                  # Message type
+        add_uint(0, 2)                                                   # Repeat
+        add_uint(mmsi, 30)                                               # MMSI
+        add_uint(1, 2)                                                   # Part number = 1
+        add_uint(vessel.get('shiptype', 0), 8)                           # Ship & cargo type
+        bits.extend(_encode_ais_text('', 7))                             # Vendor ID (42 bits)
+        bits.extend(_encode_ais_text(vessel.get('callsign', ''), 7))     # Call sign (42 bits)
+        add_uint(0, 9)                                                   # Dim to bow
+        add_uint(0, 9)                                                   # Dim to stern
+        add_uint(0, 6)                                                   # Dim to port
+        add_uint(0, 6)                                                   # Dim to starboard
+        add_uint(0, 4)                                                   # EPFS type
+        add_uint(0, 2)                                                   # Spare
+        return bits                                                      # 168 bits
 
     def _bits_to_payload(self, bits: list) -> tuple:
         fill_bits = (6 - len(bits) % 6) % 6
@@ -323,6 +415,11 @@ class AISGenerator:
             chars.append(chr(val))
         return ''.join(chars), fill_bits
 
+    def _next_seq_id(self) -> int:
+        """Return next sequential message identifier (1–9), cycling."""
+        self._seq_id = (self._seq_id % 9) + 1
+        return self._seq_id
+
     def generate_all(self) -> list:
         now_t = time.monotonic()
         dt = (now_t - self._last_t) / 3600.0
@@ -330,25 +427,52 @@ class AISGenerator:
 
         messages = []
         for mmsi, vessel in self.vessels.items():
-            # Advance vessel position
             vessel['lat'], vessel['lon'] = _move(
                 vessel['lat'], vessel['lon'],
                 vessel['cog'], vessel['sog'], dt
             )
 
-            # Type 1 — position report
-            bits1 = self._build_type1_bits(mmsi, vessel)
-            payload1, fill1 = self._bits_to_payload(bits1)
-            body1 = f"AIVDM,1,1,,A,{payload1},{fill1}"
-            messages.append(f"!{body1}*{nmea_checksum(body1)}")
+            # Determine whether static data is due this cycle.
+            # _last_static_t = 0 means never sent → send immediately.
+            last_static = vessel.get('_last_static_t', 0.0)
+            send_static = (now_t - last_static) >= self.STATIC_INTERVAL
 
-            # Type 5 — static & voyage data (split into 2 NMEA sentences)
-            bits5 = self._build_type5_bits(mmsi, vessel)
-            payload5_1, _ = self._bits_to_payload(bits5[:336])   # first 336 bits = 56 chars
-            payload5_2, fill5 = self._bits_to_payload(bits5[336:])  # remaining 88 bits
-            body5_1 = f"AIVDM,2,1,,A,{payload5_1},0"
-            body5_2 = f"AIVDM,2,2,,A,{payload5_2},{fill5}"
-            messages.append(f"!{body5_1}*{nmea_checksum(body5_1)}")
-            messages.append(f"!{body5_2}*{nmea_checksum(body5_2)}")
+            if vessel.get('ais_class', 'A') == 'A':
+                # Type 1 — Class A position report (every cycle)
+                bits1 = self._build_type1_bits(mmsi, vessel)
+                payload1, fill1 = self._bits_to_payload(bits1)
+                body1 = f"AIVDM,1,1,,A,{payload1},{fill1}"
+                messages.append(f"!{body1}*{nmea_checksum(body1)}")
+
+                # Type 5 — static & voyage data (every 6 min per ITU-R M.1371-5)
+                if send_static:
+                    seq = self._next_seq_id()
+                    bits5 = self._build_type5_bits(mmsi, vessel)
+                    payload5_1, _ = self._bits_to_payload(bits5[:336])
+                    payload5_2, fill5 = self._bits_to_payload(bits5[336:])
+                    body5_1 = f"AIVDM,2,1,{seq},A,{payload5_1},0"
+                    body5_2 = f"AIVDM,2,2,{seq},A,{payload5_2},{fill5}"
+                    messages.append(f"!{body5_1}*{nmea_checksum(body5_1)}")
+                    messages.append(f"!{body5_2}*{nmea_checksum(body5_2)}")
+                    vessel['_last_static_t'] = now_t
+            else:
+                # Type 18 — Class B position report (every cycle)
+                bits18 = self._build_type18_bits(mmsi, vessel)
+                payload18, fill18 = self._bits_to_payload(bits18)
+                body18 = f"AIVDM,1,1,,B,{payload18},{fill18}"
+                messages.append(f"!{body18}*{nmea_checksum(body18)}")
+
+                # Type 24 A + B — static data (every 6 min per ITU-R M.1371-5)
+                if send_static:
+                    bits24a = self._build_type24a_bits(mmsi, vessel)
+                    payload24a, fill24a = self._bits_to_payload(bits24a)
+                    body24a = f"AIVDM,1,1,,B,{payload24a},{fill24a}"
+                    messages.append(f"!{body24a}*{nmea_checksum(body24a)}")
+
+                    bits24b = self._build_type24b_bits(mmsi, vessel)
+                    payload24b, fill24b = self._bits_to_payload(bits24b)
+                    body24b = f"AIVDM,1,1,,B,{payload24b},{fill24b}"
+                    messages.append(f"!{body24b}*{nmea_checksum(body24b)}")
+                    vessel['_last_static_t'] = now_t
 
         return messages
