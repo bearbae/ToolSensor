@@ -152,8 +152,7 @@ class TransmitterThread(QThread):
             try:
                 messages: list[str] = []
                 if self._gps_gen:
-                    messages.append(self._gps_gen.generate())
-                    messages.append(self._gps_gen.generate_zda())
+                    messages.extend(self._gps_gen.generate_all())
                 if self._radar_gen:
                     # Sync own-ship position so bearing/range stay correct
                     if self._gps_gen:

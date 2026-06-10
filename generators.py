@@ -88,23 +88,59 @@ def _latlon_from_bearing_range(own_lat: float, own_lon: float,
 # ---------------------------------------------------------------------------
 
 class GPSGenerator:
-    """Generates GPRMC sentences. Own-ship position updates each call."""
+    """Generates GPS/navigation NMEA sentences. Position updates each call."""
 
     def __init__(self):
         self.lat = 10.776900
         self.lon = 106.700900
-        self.speed = 5.0      # knots
-        self.course = 45.0    # degrees true
+        self.speed = 5.0        # knots
+        self.course = 45.0      # degrees true
+        self.heading_true = 45.0    # true heading (HDT, THS)
+        self.heading_mag = 45.0     # magnetic heading (HDM, HDG)
+        self.mag_deviation = 0.0    # compass deviation (HDG)
+        self.mag_dev_dir = 'E'
+        self.mag_variation = 0.0    # magnetic variation (HDG)
+        self.mag_var_dir = 'E'
+        self.rate_of_turn = 0.0     # degrees/minute (ROT, +right/-left)
         self._last_t = time.monotonic()
 
-    def generate(self) -> str:
-        now_t = time.monotonic()
-        dt = (now_t - self._last_t) / 3600.0   # hours
-        self._last_t = now_t
+        # Enabled sentence flags
+        self.send_rmc = True
+        self.send_zda = True
+        self.send_hdt = False
+        self.send_hdm = False
+        self.send_hdg = False
+        self.send_rot = False
+        self.send_ths = False
 
+    def generate_all(self) -> list:
+        """Generate all enabled sentences for one transmission cycle."""
+        now_t = time.monotonic()
+        dt = (now_t - self._last_t) / 3600.0
+        self._last_t = now_t
         self.lat, self.lon = _move(self.lat, self.lon, self.course, self.speed, dt)
 
+        msgs = []
         now = datetime.datetime.now(datetime.timezone.utc)
+        if self.send_rmc:
+            msgs.append(self._rmc(now))
+        if self.send_zda:
+            msgs.append(self._zda(now))
+        if self.send_hdt:
+            msgs.append(self._hdt())
+        if self.send_hdm:
+            msgs.append(self._hdm())
+        if self.send_hdg:
+            msgs.append(self._hdg())
+        if self.send_rot:
+            msgs.append(self._rot())
+        if self.send_ths:
+            msgs.append(self._ths())
+        return msgs
+
+    # ---- individual sentence builders ------------------------------------
+
+    def _rmc(self, now: datetime.datetime) -> str:
         time_str = now.strftime("%H%M%S.00")
         date_str = now.strftime("%d%m%y")
         lat_str, lat_dir = format_nmea_lat(self.lat)
@@ -116,16 +152,46 @@ class GPSGenerator:
         )
         return f"${body}*{nmea_checksum(body)}"
 
-    def generate_zda(self) -> str:
-        """Generate GPZDA sentence with full UTC date/time (4-digit year)."""
-        now = datetime.datetime.now(datetime.timezone.utc)
+    def _zda(self, now: datetime.datetime) -> str:
         time_str = now.strftime("%H%M%S.00")
         body = (
             f"GPZDA,{time_str},"
-            f"{now.day:02d},{now.month:02d},{now.year:04d},"
-            f"00,00"
+            f"{now.day:02d},{now.month:02d},{now.year:04d},00,00"
         )
         return f"${body}*{nmea_checksum(body)}"
+
+    def _hdt(self) -> str:
+        body = f"GPHDT,{self.heading_true:.1f},T"
+        return f"${body}*{nmea_checksum(body)}"
+
+    def _hdm(self) -> str:
+        body = f"GPHDM,{self.heading_mag:.1f},M"
+        return f"${body}*{nmea_checksum(body)}"
+
+    def _hdg(self) -> str:
+        body = (
+            f"HCHDG,{self.heading_mag:.1f},"
+            f"{self.mag_deviation:.1f},{self.mag_dev_dir},"
+            f"{self.mag_variation:.1f},{self.mag_var_dir}"
+        )
+        return f"${body}*{nmea_checksum(body)}"
+
+    def _rot(self) -> str:
+        body = f"GPROT,{self.rate_of_turn:.1f},A"
+        return f"${body}*{nmea_checksum(body)}"
+
+    def _ths(self) -> str:
+        body = f"GPTHS,{self.heading_true:.1f},A"
+        return f"${body}*{nmea_checksum(body)}"
+
+    # ---- legacy wrappers (kept for compatibility) ------------------------
+
+    def generate(self) -> str:
+        return self.generate_all()[0] if self.send_rmc else ''
+
+    def generate_zda(self) -> str:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return self._zda(now)
 
     def reset_position(self, lat: float, lon: float) -> None:
         """Snap own-ship to a new position without movement history."""

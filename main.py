@@ -275,7 +275,35 @@ class MainWindow(QMainWindow):
 
         # GPS settings
         gps_grp = QGroupBox("GPS Settings")
-        gps_form = QFormLayout(gps_grp)
+        gps_layout = QVBoxLayout(gps_grp)
+
+        # --- Sentence type checkboxes ---
+        sent_row1 = QHBoxLayout()
+        self._chk_rmc = QCheckBox("RMC")
+        self._chk_zda = QCheckBox("ZDA")
+        self._chk_hdt = QCheckBox("HDT")
+        self._chk_hdm = QCheckBox("HDM")
+        self._chk_rmc.setChecked(True)
+        self._chk_zda.setChecked(True)
+        sent_row1.addWidget(self._chk_rmc)
+        sent_row1.addWidget(self._chk_zda)
+        sent_row1.addWidget(self._chk_hdt)
+        sent_row1.addWidget(self._chk_hdm)
+
+        sent_row2 = QHBoxLayout()
+        self._chk_hdg = QCheckBox("HDG")
+        self._chk_rot = QCheckBox("ROT")
+        self._chk_ths = QCheckBox("THS")
+        sent_row2.addWidget(self._chk_hdg)
+        sent_row2.addWidget(self._chk_rot)
+        sent_row2.addWidget(self._chk_ths)
+        sent_row2.addStretch()
+
+        gps_layout.addLayout(sent_row1)
+        gps_layout.addLayout(sent_row2)
+
+        # --- Position & movement ---
+        gps_form = QFormLayout()
 
         self._gps_lat = QDoubleSpinBox()
         self._gps_lat.setRange(-90.0, 90.0)
@@ -302,7 +330,56 @@ class MainWindow(QMainWindow):
         gps_form.addRow("Latitude:", self._gps_lat)
         gps_form.addRow("Longitude:", self._gps_lon)
         gps_form.addRow("Speed:", self._gps_speed)
-        gps_form.addRow("Course:", self._gps_course)
+        gps_form.addRow("Course (True):", self._gps_course)
+
+        # --- Heading & rotation (for HDT/HDM/HDG/ROT/THS) ---
+        self._gps_hdg_true = QDoubleSpinBox()
+        self._gps_hdg_true.setRange(0.0, 360.0)
+        self._gps_hdg_true.setDecimals(1)
+        self._gps_hdg_true.setValue(45.0)
+        self._gps_hdg_true.setSuffix(" °")
+
+        self._gps_hdg_mag = QDoubleSpinBox()
+        self._gps_hdg_mag.setRange(0.0, 360.0)
+        self._gps_hdg_mag.setDecimals(1)
+        self._gps_hdg_mag.setValue(45.0)
+        self._gps_hdg_mag.setSuffix(" °")
+
+        # Deviation row
+        dev_row = QHBoxLayout()
+        self._gps_dev = QDoubleSpinBox()
+        self._gps_dev.setRange(0.0, 180.0)
+        self._gps_dev.setDecimals(1)
+        self._gps_dev.setSuffix(" °")
+        self._gps_dev_dir = QComboBox()
+        self._gps_dev_dir.addItems(["E", "W"])
+        dev_row.addWidget(self._gps_dev)
+        dev_row.addWidget(self._gps_dev_dir)
+
+        # Variation row
+        var_row = QHBoxLayout()
+        self._gps_var = QDoubleSpinBox()
+        self._gps_var.setRange(0.0, 180.0)
+        self._gps_var.setDecimals(1)
+        self._gps_var.setSuffix(" °")
+        self._gps_var_dir = QComboBox()
+        self._gps_var_dir.addItems(["E", "W"])
+        var_row.addWidget(self._gps_var)
+        var_row.addWidget(self._gps_var_dir)
+
+        self._gps_rot = QDoubleSpinBox()
+        self._gps_rot.setRange(-720.0, 720.0)
+        self._gps_rot.setDecimals(1)
+        self._gps_rot.setSuffix(" °/min")
+        self._gps_rot.setToolTip("Positive = turning right, Negative = turning left")
+
+        gps_form.addRow("Heading (True):", self._gps_hdg_true)
+        gps_form.addRow("Heading (Mag):", self._gps_hdg_mag)
+        gps_form.addRow("Deviation:", dev_row)
+        gps_form.addRow("Variation:", var_row)
+        gps_form.addRow("Rate of Turn:", self._gps_rot)
+
+        gps_layout.addLayout(gps_form)
         layout.addWidget(gps_grp)
 
         # Start / Stop
@@ -631,19 +708,29 @@ class MainWindow(QMainWindow):
         self._btn_start.clicked.connect(self._on_start)
         self._btn_stop.clicked.connect(self._on_stop)
 
-        # GPS live-update generator
-        self._gps_lat.valueChanged.connect(
-            lambda v: setattr(self._gps_gen, 'lat', v)
-        )
-        self._gps_lon.valueChanged.connect(
-            lambda v: setattr(self._gps_gen, 'lon', v)
-        )
-        self._gps_speed.valueChanged.connect(
-            lambda v: setattr(self._gps_gen, 'speed', v)
-        )
-        self._gps_course.valueChanged.connect(
-            lambda v: setattr(self._gps_gen, 'course', v)
-        )
+        # GPS live-update generator — position & movement
+        self._gps_lat.valueChanged.connect(lambda v: setattr(self._gps_gen, 'lat', v))
+        self._gps_lon.valueChanged.connect(lambda v: setattr(self._gps_gen, 'lon', v))
+        self._gps_speed.valueChanged.connect(lambda v: setattr(self._gps_gen, 'speed', v))
+        self._gps_course.valueChanged.connect(lambda v: setattr(self._gps_gen, 'course', v))
+
+        # GPS — heading & rotation
+        self._gps_hdg_true.valueChanged.connect(lambda v: setattr(self._gps_gen, 'heading_true', v))
+        self._gps_hdg_mag.valueChanged.connect(lambda v: setattr(self._gps_gen, 'heading_mag', v))
+        self._gps_dev.valueChanged.connect(lambda v: setattr(self._gps_gen, 'mag_deviation', v))
+        self._gps_dev_dir.currentTextChanged.connect(lambda v: setattr(self._gps_gen, 'mag_dev_dir', v))
+        self._gps_var.valueChanged.connect(lambda v: setattr(self._gps_gen, 'mag_variation', v))
+        self._gps_var_dir.currentTextChanged.connect(lambda v: setattr(self._gps_gen, 'mag_var_dir', v))
+        self._gps_rot.valueChanged.connect(lambda v: setattr(self._gps_gen, 'rate_of_turn', v))
+
+        # GPS — sentence type toggles
+        self._chk_rmc.toggled.connect(lambda v: setattr(self._gps_gen, 'send_rmc', v))
+        self._chk_zda.toggled.connect(lambda v: setattr(self._gps_gen, 'send_zda', v))
+        self._chk_hdt.toggled.connect(lambda v: setattr(self._gps_gen, 'send_hdt', v))
+        self._chk_hdm.toggled.connect(lambda v: setattr(self._gps_gen, 'send_hdm', v))
+        self._chk_hdg.toggled.connect(lambda v: setattr(self._gps_gen, 'send_hdg', v))
+        self._chk_rot.toggled.connect(lambda v: setattr(self._gps_gen, 'send_rot', v))
+        self._chk_ths.toggled.connect(lambda v: setattr(self._gps_gen, 'send_ths', v))
 
         # Radar targets
         self._btn_r_add.clicked.connect(self._on_radar_add)
