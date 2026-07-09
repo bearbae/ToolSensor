@@ -112,6 +112,29 @@ class GPSGenerator:
         self.send_hdg = False
         self.send_rot = False
         self.send_ths = False
+        self.send_rmb = False
+        self.send_vdo = False
+
+        # RMB waypoint parameters
+        self.rmb_origin_id = 'WP00'
+        self.rmb_dest_id = 'WP01'
+        self.rmb_dest_lat = 10.776900
+        self.rmb_dest_lon = 106.700900
+        self.rmb_xte = 0.0       # cross-track error (NM)
+        self.rmb_steer = 'L'     # direction to steer: L or R
+
+        # VDO (own-ship AIS transponder) parameters
+        self.vdo_mmsi = 123456789
+        self.vdo_ais_class = 'A'
+        self.vdo_nav_status = 0
+        self.vdo_shipname = ''
+        self.vdo_callsign = ''
+        self.vdo_shiptype = 0
+        self.vdo_imo = 0
+        self.vdo_destination = ''
+        self.vdo_eta = (0, 0, 24, 60)
+        self._vdo_last_static_t = 0.0
+        self._vdo_seq_id = 0
 
     def generate_all(self) -> list:
         """Generate all enabled sentences for one transmission cycle."""
@@ -136,6 +159,10 @@ class GPSGenerator:
             msgs.append(self._rot())
         if self.send_ths:
             msgs.append(self._ths())
+        if self.send_rmb:
+            msgs.append(self._rmb())
+        if self.send_vdo:
+            msgs.extend(self._vdo_sentences(now_t))
         return msgs
 
     # ---- individual sentence builders ------------------------------------
@@ -184,6 +211,164 @@ class GPSGenerator:
         body = f"GPTHS,{self.heading_true:.1f},A"
         return f"${body}*{nmea_checksum(body)}"
 
+    def _rmb(self) -> str:
+        bearing, range_nm = _bearing_range(
+            self.lat, self.lon, self.rmb_dest_lat, self.rmb_dest_lon
+        )
+        angle_diff = math.radians(bearing - self.course)
+        closing_vel = max(0.0, self.speed * math.cos(angle_diff))
+        arrival = 'A' if range_nm < 0.05 else 'V'
+        dest_lat_str, dest_lat_dir = format_nmea_lat(self.rmb_dest_lat)
+        dest_lon_str, dest_lon_dir = format_nmea_lon(self.rmb_dest_lon)
+        body = (
+            f"GPRMB,A,{abs(self.rmb_xte):.2f},{self.rmb_steer},"
+            f"{self.rmb_origin_id},{self.rmb_dest_id},"
+            f"{dest_lat_str},{dest_lat_dir},"
+            f"{dest_lon_str},{dest_lon_dir},"
+            f"{range_nm:.3f},{bearing:.1f},"
+            f"{closing_vel:.1f},{arrival},A"
+        )
+        return f"${body}*{nmea_checksum(body)}"
+
+    # ---- AIVDO (own-ship AIS transponder) -------------------------------
+
+    def _vdo_bits_to_payload(self, bits: list) -> tuple:
+        fill_bits = (6 - len(bits) % 6) % 6
+        while len(bits) % 6 != 0:
+            bits.append(0)
+        chars = []
+        for i in range(0, len(bits), 6):
+            val = 0
+            for j in range(6):
+                val = (val << 1) | bits[i + j]
+            val += 48
+            if val > 87:
+                val += 8
+            chars.append(chr(val))
+        return ''.join(chars), fill_bits
+
+    def _vdo_type1_bits(self) -> list:
+        bits = []
+        def add_uint(v, n):
+            v = int(v) & ((1 << n) - 1)
+            for i in range(n - 1, -1, -1): bits.append((v >> i) & 1)
+        def add_int(v, n):
+            v = int(v)
+            if v < 0: v += (1 << n)
+            v &= (1 << n) - 1
+            for i in range(n - 1, -1, -1): bits.append((v >> i) & 1)
+        add_uint(1, 6); add_uint(0, 2); add_uint(self.vdo_mmsi, 30)
+        add_uint(self.vdo_nav_status, 4); add_int(-128, 8)
+        add_uint(int(self.speed * 10), 10); add_uint(0, 1)
+        add_int(round(self.lon * 600000), 28)
+        add_int(round(self.lat * 600000), 27)
+        add_uint(int(self.course * 10), 12)
+        add_uint(int(self.heading_true) % 360, 9)
+        add_uint(datetime.datetime.now(datetime.timezone.utc).second, 6)
+        add_uint(0, 2); add_uint(0, 3); add_uint(0, 1); add_uint(0, 19)
+        return bits  # 168 bits
+
+    def _vdo_type5_bits(self) -> list:
+        bits = []
+        def add_uint(v, n):
+            v = int(v) & ((1 << n) - 1)
+            for i in range(n - 1, -1, -1): bits.append((v >> i) & 1)
+        add_uint(5, 6); add_uint(0, 2); add_uint(self.vdo_mmsi, 30)
+        add_uint(0, 2); add_uint(self.vdo_imo, 30)
+        bits.extend(_encode_ais_text(self.vdo_callsign, 7))
+        bits.extend(_encode_ais_text(self.vdo_shipname, 20))
+        add_uint(self.vdo_shiptype, 8)
+        add_uint(0, 9); add_uint(0, 9); add_uint(0, 6); add_uint(0, 6)
+        add_uint(0, 4)
+        eta = self.vdo_eta
+        add_uint(eta[0], 4); add_uint(eta[1], 5)
+        add_uint(eta[2], 5); add_uint(eta[3], 6)
+        add_uint(0, 8)
+        bits.extend(_encode_ais_text(self.vdo_destination, 20))
+        add_uint(0, 1); add_uint(0, 1)
+        return bits  # 424 bits
+
+    def _vdo_type18_bits(self) -> list:
+        bits = []
+        def add_uint(v, n):
+            v = int(v) & ((1 << n) - 1)
+            for i in range(n - 1, -1, -1): bits.append((v >> i) & 1)
+        def add_int(v, n):
+            v = int(v)
+            if v < 0: v += (1 << n)
+            v &= (1 << n) - 1
+            for i in range(n - 1, -1, -1): bits.append((v >> i) & 1)
+        add_uint(18, 6); add_uint(0, 2); add_uint(self.vdo_mmsi, 30)
+        add_uint(0, 8); add_uint(int(self.speed * 10), 10); add_uint(0, 1)
+        add_int(round(self.lon * 600000), 28)
+        add_int(round(self.lat * 600000), 27)
+        add_uint(int(self.course * 10), 12)
+        add_uint(int(self.heading_true) % 360, 9)
+        add_uint(datetime.datetime.now(datetime.timezone.utc).second, 6)
+        add_uint(0, 2); add_uint(1, 1); add_uint(0, 1)
+        add_uint(1, 1); add_uint(1, 1); add_uint(1, 1)
+        add_uint(0, 1); add_uint(0, 1); add_uint(0, 20)
+        return bits  # 168 bits
+
+    def _vdo_type24a_bits(self) -> list:
+        bits = []
+        def add_uint(v, n):
+            v = int(v) & ((1 << n) - 1)
+            for i in range(n - 1, -1, -1): bits.append((v >> i) & 1)
+        add_uint(24, 6); add_uint(0, 2); add_uint(self.vdo_mmsi, 30)
+        add_uint(0, 2)
+        bits.extend(_encode_ais_text(self.vdo_shipname, 20))
+        add_uint(0, 8)
+        return bits  # 168 bits
+
+    def _vdo_type24b_bits(self) -> list:
+        bits = []
+        def add_uint(v, n):
+            v = int(v) & ((1 << n) - 1)
+            for i in range(n - 1, -1, -1): bits.append((v >> i) & 1)
+        add_uint(24, 6); add_uint(0, 2); add_uint(self.vdo_mmsi, 30)
+        add_uint(1, 2); add_uint(self.vdo_shiptype, 8)
+        bits.extend(_encode_ais_text('', 7))
+        bits.extend(_encode_ais_text(self.vdo_callsign, 7))
+        add_uint(0, 9); add_uint(0, 9); add_uint(0, 6); add_uint(0, 6)
+        add_uint(0, 4); add_uint(0, 2)
+        return bits  # 168 bits
+
+    def _vdo_sentences(self, now_t: float) -> list:
+        msgs = []
+        if self.vdo_ais_class == 'A':
+            bits1 = self._vdo_type1_bits()
+            p1, f1 = self._vdo_bits_to_payload(bits1)
+            body = f"AIVDO,1,1,,A,{p1},{f1}"
+            msgs.append(f"!{body}*{nmea_checksum(body)}")
+            if (now_t - self._vdo_last_static_t) >= 360.0:
+                self._vdo_seq_id = (self._vdo_seq_id % 9) + 1
+                bits5 = self._vdo_type5_bits()
+                pa, _ = self._vdo_bits_to_payload(bits5[:336])
+                pb, fb = self._vdo_bits_to_payload(bits5[336:])
+                seq = self._vdo_seq_id
+                b1 = f"AIVDO,2,1,{seq},A,{pa},0"
+                b2 = f"AIVDO,2,2,{seq},A,{pb},{fb}"
+                msgs.append(f"!{b1}*{nmea_checksum(b1)}")
+                msgs.append(f"!{b2}*{nmea_checksum(b2)}")
+                self._vdo_last_static_t = now_t
+        else:
+            bits18 = self._vdo_type18_bits()
+            p18, f18 = self._vdo_bits_to_payload(bits18)
+            body = f"AIVDO,1,1,,B,{p18},{f18}"
+            msgs.append(f"!{body}*{nmea_checksum(body)}")
+            if (now_t - self._vdo_last_static_t) >= 360.0:
+                bits24a = self._vdo_type24a_bits()
+                p24a, f24a = self._vdo_bits_to_payload(bits24a)
+                ba = f"AIVDO,1,1,,B,{p24a},{f24a}"
+                msgs.append(f"!{ba}*{nmea_checksum(ba)}")
+                bits24b = self._vdo_type24b_bits()
+                p24b, f24b = self._vdo_bits_to_payload(bits24b)
+                bb = f"AIVDO,1,1,,B,{p24b},{f24b}"
+                msgs.append(f"!{bb}*{nmea_checksum(bb)}")
+                self._vdo_last_static_t = now_t
+        return msgs
+
     # ---- legacy wrappers (kept for compatibility) ------------------------
 
     def generate(self) -> str:
@@ -212,6 +397,25 @@ class RadarTTMGenerator:
         # Reference for own-ship position (kept in sync with GPSGenerator)
         self.own_lat = 10.776900
         self.own_lon = 106.700900
+
+        # OSD (Own Ship Data)
+        self.send_osd = False
+        self.osd_heading = 0.0
+        self.osd_course = 0.0
+        self.osd_speed = 0.0
+        self.osd_set = 0.0      # current set (degrees true)
+        self.osd_drift = 0.0    # current drift (knots)
+
+        # RSD (Radar System Data)
+        self.send_rsd = False
+        self.rsd_vrm1 = 1.0
+        self.rsd_ebl1 = 0.0
+        self.rsd_vrm2 = 3.0
+        self.rsd_ebl2 = 90.0
+        self.rsd_range = 6.0
+        self.rsd_cursor_range = 0.0
+        self.rsd_cursor_bearing = 0.0
+        self.rsd_rotation = 'N'   # N=North-up, H=Head-up, C=Course-up
 
     def add_or_update_target(
         self,
@@ -263,7 +467,30 @@ class RadarTTMGenerator:
                 f"{t['name']},{t['status']}"
             )
             messages.append(f"${body}*{nmea_checksum(body)}")
+
+        if self.send_osd:
+            messages.append(self._osd())
+        if self.send_rsd:
+            messages.append(self._rsd())
         return messages
+
+    def _osd(self) -> str:
+        body = (
+            f"RAOSD,{self.osd_heading:.1f},A,"
+            f"{self.osd_course:.1f},T,"
+            f"{self.osd_speed:.1f},N,"
+            f"{self.osd_set:.1f},{self.osd_drift:.1f},N"
+        )
+        return f"${body}*{nmea_checksum(body)}"
+
+    def _rsd(self) -> str:
+        body = (
+            f"RARSD,0.0,0.0,{self.rsd_vrm1:.1f},{self.rsd_ebl1:.1f},"
+            f"0.0,0.0,{self.rsd_vrm2:.1f},{self.rsd_ebl2:.1f},"
+            f"{self.rsd_cursor_range:.1f},{self.rsd_cursor_bearing:.1f},"
+            f"{self.rsd_range:.1f},N,{self.rsd_rotation}"
+        )
+        return f"${body}*{nmea_checksum(body)}"
 
 
 # ---------------------------------------------------------------------------

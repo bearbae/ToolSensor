@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -126,13 +127,19 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
 
-        # ---- Left panel --------------------------------------------------
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
+        # ---- Left panel (scrollable) -------------------------------------
+        left_inner = QWidget()
+        left_layout = QVBoxLayout(left_inner)
         left_layout.setSpacing(8)
         left_layout.addWidget(self._build_connection_panel())
         left_layout.addWidget(self._build_generator_panel())
         left_layout.addStretch()
+
+        left_scroll = QScrollArea()
+        left_scroll.setWidget(left_inner)
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setFrameShape(left_scroll.Shape.NoFrame)
 
         # ---- Right panel -------------------------------------------------
         right = QWidget()
@@ -142,7 +149,7 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self._build_log_panel(), stretch=3)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(left)
+        splitter.addWidget(left_scroll)
         splitter.addWidget(right)
         splitter.setSizes([400, 860])
         root.addWidget(splitter)
@@ -285,18 +292,17 @@ class MainWindow(QMainWindow):
         self._chk_hdm = QCheckBox("HDM")
         self._chk_rmc.setChecked(True)
         self._chk_zda.setChecked(True)
-        sent_row1.addWidget(self._chk_rmc)
-        sent_row1.addWidget(self._chk_zda)
-        sent_row1.addWidget(self._chk_hdt)
-        sent_row1.addWidget(self._chk_hdm)
+        for w in (self._chk_rmc, self._chk_zda, self._chk_hdt, self._chk_hdm):
+            sent_row1.addWidget(w)
+        sent_row1.addStretch()
 
         sent_row2 = QHBoxLayout()
         self._chk_hdg = QCheckBox("HDG")
         self._chk_rot = QCheckBox("ROT")
         self._chk_ths = QCheckBox("THS")
-        sent_row2.addWidget(self._chk_hdg)
-        sent_row2.addWidget(self._chk_rot)
-        sent_row2.addWidget(self._chk_ths)
+        self._chk_rmb = QCheckBox("RMB")
+        for w in (self._chk_hdg, self._chk_rot, self._chk_ths, self._chk_rmb):
+            sent_row2.addWidget(w)
         sent_row2.addStretch()
 
         gps_layout.addLayout(sent_row1)
@@ -380,6 +386,44 @@ class MainWindow(QMainWindow):
         gps_form.addRow("Rate of Turn:", self._gps_rot)
 
         gps_layout.addLayout(gps_form)
+
+        # RMB waypoint sub-group (visible only when RMB checked)
+        self._rmb_grp = QGroupBox("RMB Waypoint")
+        self._rmb_grp.setVisible(False)
+        rmb_form = QFormLayout(self._rmb_grp)
+
+        self._rmb_origin_id = QLineEdit("WP00")
+        self._rmb_origin_id.setMaxLength(10)
+
+        self._rmb_dest_id = QLineEdit("WP01")
+        self._rmb_dest_id.setMaxLength(10)
+
+        self._rmb_dest_lat = QDoubleSpinBox()
+        self._rmb_dest_lat.setRange(-90.0, 90.0)
+        self._rmb_dest_lat.setDecimals(6)
+        self._rmb_dest_lat.setValue(10.776900)
+
+        self._rmb_dest_lon = QDoubleSpinBox()
+        self._rmb_dest_lon.setRange(-180.0, 180.0)
+        self._rmb_dest_lon.setDecimals(6)
+        self._rmb_dest_lon.setValue(106.700900)
+
+        self._rmb_xte = QDoubleSpinBox()
+        self._rmb_xte.setRange(0.0, 9.99)
+        self._rmb_xte.setDecimals(2)
+        self._rmb_xte.setSuffix(" NM")
+
+        self._rmb_steer = QComboBox()
+        self._rmb_steer.addItems(["L  (Left)", "R  (Right)"])
+
+        rmb_form.addRow("Origin WP:", self._rmb_origin_id)
+        rmb_form.addRow("Dest WP:", self._rmb_dest_id)
+        rmb_form.addRow("Dest Lat:", self._rmb_dest_lat)
+        rmb_form.addRow("Dest Lon:", self._rmb_dest_lon)
+        rmb_form.addRow("Cross-Track Error:", self._rmb_xte)
+        rmb_form.addRow("Steer:", self._rmb_steer)
+
+        gps_layout.addWidget(self._rmb_grp)
         layout.addWidget(gps_grp)
 
         # Start / Stop
@@ -418,12 +462,12 @@ class MainWindow(QMainWindow):
 
         self._r_bearing = QDoubleSpinBox()
         self._r_bearing.setRange(0.0, 360.0)
-        self._r_bearing.setDecimals(1)
+        self._r_bearing.setDecimals(4)
         self._r_bearing.setSuffix(" °")
 
         self._r_range = QDoubleSpinBox()
-        self._r_range.setRange(0.01, 100.0)
-        self._r_range.setDecimals(2)
+        self._r_range.setRange(0.0001, 100.0)
+        self._r_range.setDecimals(4)
         self._r_range.setValue(1.0)
         self._r_range.setSuffix(" NM")
 
@@ -452,6 +496,49 @@ class MainWindow(QMainWindow):
         rt_form.addRow("Status:", self._r_status)
         rt_layout.addLayout(rt_form)
 
+        # ── Chuyển đổi tọa độ 2 chiều ────────────────────────────────────────
+        latlon_grp = QGroupBox("Chuyển đổi tọa độ")
+        latlon_grp.setStyleSheet("QGroupBox { color: #0d6efd; font-weight: bold; }")
+        latlon_vl = QVBoxLayout(latlon_grp)
+
+        # Chiều 1: Bearing+Range → Lat/Lon (tính từ form trên)
+        row_br2ll = QHBoxLayout()
+        row_br2ll.addWidget(QLabel("Brg+Rng → "))
+        self._r_computed_lat = QLineEdit()
+        self._r_computed_lat.setReadOnly(True)
+        self._r_computed_lat.setPlaceholderText("Lat")
+        self._r_computed_lon = QLineEdit()
+        self._r_computed_lon.setReadOnly(True)
+        self._r_computed_lon.setPlaceholderText("Lon")
+        self._btn_r_copy_latlon = QPushButton("Copy")
+        self._btn_r_copy_latlon.setFixedWidth(54)
+        self._btn_r_copy_latlon.setToolTip("Copy lat,lon vào clipboard")
+        row_br2ll.addWidget(self._r_computed_lat, stretch=1)
+        row_br2ll.addWidget(self._r_computed_lon, stretch=1)
+        row_br2ll.addWidget(self._btn_r_copy_latlon)
+        latlon_vl.addLayout(row_br2ll)
+
+        # Chiều 2: Lat/Lon → Bearing+Range (fill vào form trên)
+        row_ll2br = QHBoxLayout()
+        row_ll2br.addWidget(QLabel("Lat/Lon →  "))
+        self._r_input_lat = QDoubleSpinBox()
+        self._r_input_lat.setRange(-90.0, 90.0)
+        self._r_input_lat.setDecimals(6)
+        self._r_input_lat.setPrefix("Lat ")
+        self._r_input_lon = QDoubleSpinBox()
+        self._r_input_lon.setRange(-180.0, 180.0)
+        self._r_input_lon.setDecimals(6)
+        self._r_input_lon.setPrefix("Lon ")
+        self._btn_r_calc_bearing = QPushButton("Fill")
+        self._btn_r_calc_bearing.setFixedWidth(54)
+        self._btn_r_calc_bearing.setToolTip("Tính Bearing+Range từ lat/lon rồi điền vào form")
+        row_ll2br.addWidget(self._r_input_lat, stretch=1)
+        row_ll2br.addWidget(self._r_input_lon, stretch=1)
+        row_ll2br.addWidget(self._btn_r_calc_bearing)
+        latlon_vl.addLayout(row_ll2br)
+
+        rt_layout.addWidget(latlon_grp)
+
         rb_row = QHBoxLayout()
         self._btn_r_add = QPushButton("Add / Update")
         self._btn_r_remove = QPushButton("Remove")
@@ -463,7 +550,7 @@ class MainWindow(QMainWindow):
         r_auto_row = QHBoxLayout()
         r_auto_row.addWidget(QLabel("Auto generate:"))
         self._r_auto_count = QSpinBox()
-        self._r_auto_count.setRange(1, 50)
+        self._r_auto_count.setRange(1, 9999)
         self._r_auto_count.setValue(5)
         self._r_auto_count.setSuffix(" targets")
         self._btn_r_auto = QPushButton("Generate")
@@ -472,6 +559,84 @@ class MainWindow(QMainWindow):
         r_auto_row.addWidget(self._btn_r_auto)
         r_auto_row.addWidget(self._btn_r_clear)
         rt_layout.addLayout(r_auto_row)
+
+        # OSD / RSD checkboxes
+        osd_rsd_row = QHBoxLayout()
+        self._chk_osd = QCheckBox("OSD  (Own Ship Data)")
+        self._chk_rsd = QCheckBox("RSD  (Radar System Data)")
+        osd_rsd_row.addWidget(self._chk_osd)
+        osd_rsd_row.addWidget(self._chk_rsd)
+        osd_rsd_row.addStretch()
+        rt_layout.addLayout(osd_rsd_row)
+
+        # OSD sub-group
+        self._osd_grp = QGroupBox("OSD Settings")
+        self._osd_grp.setVisible(False)
+        osd_form = QFormLayout(self._osd_grp)
+
+        self._osd_set = QDoubleSpinBox()
+        self._osd_set.setRange(0.0, 360.0)
+        self._osd_set.setDecimals(1)
+        self._osd_set.setSuffix(" °")
+        self._osd_set.setToolTip("Current set (drift direction, degrees true)")
+
+        self._osd_drift = QDoubleSpinBox()
+        self._osd_drift.setRange(0.0, 10.0)
+        self._osd_drift.setDecimals(1)
+        self._osd_drift.setSuffix(" kn")
+        self._osd_drift.setToolTip("Current drift speed (knots)")
+
+        osd_form.addRow("Set:", self._osd_set)
+        osd_form.addRow("Drift:", self._osd_drift)
+        lbl_osd_note = QLabel("Heading / Course / Speed — auto-sync từ GPS")
+        lbl_osd_note.setStyleSheet("color:#90a4ae; font-style:italic;")
+        osd_form.addRow("", lbl_osd_note)
+        rt_layout.addWidget(self._osd_grp)
+
+        # RSD sub-group
+        self._rsd_grp = QGroupBox("RSD Settings")
+        self._rsd_grp.setVisible(False)
+        rsd_form = QFormLayout(self._rsd_grp)
+
+        self._rsd_vrm1 = QDoubleSpinBox()
+        self._rsd_vrm1.setRange(0.0, 200.0)
+        self._rsd_vrm1.setDecimals(1)
+        self._rsd_vrm1.setValue(1.0)
+        self._rsd_vrm1.setSuffix(" NM")
+
+        self._rsd_ebl1 = QDoubleSpinBox()
+        self._rsd_ebl1.setRange(0.0, 360.0)
+        self._rsd_ebl1.setDecimals(1)
+        self._rsd_ebl1.setSuffix(" °")
+
+        self._rsd_vrm2 = QDoubleSpinBox()
+        self._rsd_vrm2.setRange(0.0, 200.0)
+        self._rsd_vrm2.setDecimals(1)
+        self._rsd_vrm2.setValue(3.0)
+        self._rsd_vrm2.setSuffix(" NM")
+
+        self._rsd_ebl2 = QDoubleSpinBox()
+        self._rsd_ebl2.setRange(0.0, 360.0)
+        self._rsd_ebl2.setDecimals(1)
+        self._rsd_ebl2.setValue(90.0)
+        self._rsd_ebl2.setSuffix(" °")
+
+        self._rsd_range = QDoubleSpinBox()
+        self._rsd_range.setRange(0.1, 200.0)
+        self._rsd_range.setDecimals(1)
+        self._rsd_range.setValue(6.0)
+        self._rsd_range.setSuffix(" NM")
+
+        self._rsd_rotation = QComboBox()
+        self._rsd_rotation.addItems(["N  (North-up)", "H  (Head-up)", "C  (Course-up)"])
+
+        rsd_form.addRow("VRM 1:", self._rsd_vrm1)
+        rsd_form.addRow("EBL 1:", self._rsd_ebl1)
+        rsd_form.addRow("VRM 2:", self._rsd_vrm2)
+        rsd_form.addRow("EBL 2:", self._rsd_ebl2)
+        rsd_form.addRow("Range Scale:", self._rsd_range)
+        rsd_form.addRow("Display Rotation:", self._rsd_rotation)
+        rt_layout.addWidget(self._rsd_grp)
 
         self._radar_list = QListWidget()
         self._radar_list.setMaximumHeight(90)
@@ -592,12 +757,15 @@ class MainWindow(QMainWindow):
         a_auto_row = QHBoxLayout()
         a_auto_row.addWidget(QLabel("Auto generate:"))
         self._a_auto_count = QSpinBox()
-        self._a_auto_count.setRange(1, 50)
+        self._a_auto_count.setRange(1, 9999)
         self._a_auto_count.setValue(5)
         self._a_auto_count.setSuffix(" vessels")
+        self._a_auto_mode = QComboBox()
+        self._a_auto_mode.addItems(["Xung quanh tàu mình", "Vùng biển Việt Nam"])
         self._btn_a_auto = QPushButton("Generate")
         self._btn_a_clear = QPushButton("Clear All")
         a_auto_row.addWidget(self._a_auto_count)
+        a_auto_row.addWidget(self._a_auto_mode)
         a_auto_row.addWidget(self._btn_a_auto)
         a_auto_row.addWidget(self._btn_a_clear)
         at_layout.addLayout(a_auto_row)
@@ -606,6 +774,9 @@ class MainWindow(QMainWindow):
         self._ais_list.setMaximumHeight(90)
         at_layout.addWidget(self._ais_list)
         tabs.addTab(ais_tab, "AIS  (VDM)")
+
+        # ---- VDO tab -----------------------------------------------------
+        tabs.addTab(self._build_vdo_tab(), "VDO  (Own Ship)")
 
         # ---- Fusion Test tab ---------------------------------------------
         tabs.addTab(self._build_fusion_tab(), "Fusion Test")
@@ -617,20 +788,99 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        form = QFormLayout()
+        inner_tabs = QTabWidget()
+
+        # ── Sub-tab 1: Tạo thủ công ──────────────────────────────────────
+        manual_tab = QWidget()
+        ml = QVBoxLayout(manual_tab)
+        mf = QFormLayout()
+
+        self._fm_target_id = QSpinBox()
+        self._fm_target_id.setRange(1, 99)
+        self._fm_target_id.setValue(1)
+
+        self._fm_bearing = QDoubleSpinBox()
+        self._fm_bearing.setRange(0.0, 360.0)
+        self._fm_bearing.setDecimals(1)
+        self._fm_bearing.setSuffix(" °")
+
+        self._fm_range = QDoubleSpinBox()
+        self._fm_range.setRange(0.01, 200.0)
+        self._fm_range.setDecimals(2)
+        self._fm_range.setValue(2.0)
+        self._fm_range.setSuffix(" NM")
+
+        self._fm_speed = QDoubleSpinBox()
+        self._fm_speed.setRange(0.0, 100.0)
+        self._fm_speed.setDecimals(1)
+        self._fm_speed.setSuffix(" kn")
+
+        self._fm_course = QDoubleSpinBox()
+        self._fm_course.setRange(0.0, 360.0)
+        self._fm_course.setDecimals(1)
+        self._fm_course.setSuffix(" °")
+
+        self._fm_name = QLineEdit()
+        self._fm_name.setPlaceholderText("Tên tàu (dùng cho cả Radar + AIS)")
+        self._fm_name.setMaxLength(20)
+
+        self._fm_mmsi = QLineEdit()
+        self._fm_mmsi.setValidator(QIntValidator(100_000_000, 999_999_999))
+        self._fm_mmsi.setPlaceholderText("9-digit MMSI")
+
+        self._fm_shiptype = QSpinBox()
+        self._fm_shiptype.setRange(0, 99)
+        self._fm_shiptype.setValue(70)
+        self._fm_shiptype.setToolTip(
+            "0=N/A  30=Fishing  52=Tug  60-69=Passenger\n"
+            "70-79=Cargo  80-89=Tanker  90-99=Other"
+        )
+
+        self._fm_ais_class = QComboBox()
+        self._fm_ais_class.addItems(["Class A  (Type 1 + Type 5)", "Class B  (Type 18 + Type 24)"])
+
+        self._fm_nav_status = QComboBox()
+        self._fm_nav_status.addItems([
+            "0 – Under way (engine)",
+            "1 – At anchor",
+            "5 – Moored",
+        ])
+
+        mf.addRow("Target ID (Radar):", self._fm_target_id)
+        mf.addRow("Bearing:", self._fm_bearing)
+        mf.addRow("Range:", self._fm_range)
+        mf.addRow("Speed:", self._fm_speed)
+        mf.addRow("Course:", self._fm_course)
+        mf.addRow("Tên tàu:", self._fm_name)
+        mf.addRow("MMSI:", self._fm_mmsi)
+        mf.addRow("Ship Type:", self._fm_shiptype)
+        mf.addRow("AIS Class:", self._fm_ais_class)
+        mf.addRow("Nav Status:", self._fm_nav_status)
+        ml.addLayout(mf)
+
+        self._btn_fm_add = QPushButton("Thêm cặp Fused")
+        self._btn_fm_add.setStyleSheet(_btn_qss("#0d6efd", "#0b5ed7", "#0a52be"))
+        ml.addWidget(self._btn_fm_add)
+        ml.addStretch()
+        inner_tabs.addTab(manual_tab, "Thủ công")
+
+        # ── Sub-tab 2: Auto Generate ──────────────────────────────────────
+        auto_tab = QWidget()
+        al = QVBoxLayout(auto_tab)
+        af = QFormLayout()
 
         self._f_fused_count = QSpinBox()
-        self._f_fused_count.setRange(1, 30)
+        self._f_fused_count.setRange(1, 9999)
         self._f_fused_count.setValue(3)
         self._f_fused_count.setSuffix("  cặp")
 
         self._f_radar_only_count = QSpinBox()
-        self._f_radar_only_count.setRange(0, 20)
+        self._f_radar_only_count.setRange(0, 9999)
         self._f_radar_only_count.setValue(2)
         self._f_radar_only_count.setSuffix("  targets")
 
         self._f_ais_only_count = QSpinBox()
-        self._f_ais_only_count.setRange(0, 20)
+        self._f_ais_only_count.setRange(0, 9999)
         self._f_ais_only_count.setValue(2)
         self._f_ais_only_count.setSuffix("  vessels")
 
@@ -638,21 +888,115 @@ class MainWindow(QMainWindow):
         self._f_mid.addItem("Mix (random countries)")
         self._f_mid.addItems(self._MID_TABLE.keys())
 
-        form.addRow("Fused (Radar + AIS):", self._f_fused_count)
-        form.addRow("Radar-only:", self._f_radar_only_count)
-        form.addRow("AIS-only:", self._f_ais_only_count)
-        form.addRow("MMSI Country:", self._f_mid)
-        layout.addLayout(form)
+        self._f_ais_mode = QComboBox()
+        self._f_ais_mode.addItems(["Xung quanh tàu mình", "Vùng biển Việt Nam"])
+
+        af.addRow("Fused (Radar + AIS):", self._f_fused_count)
+        af.addRow("Radar-only:", self._f_radar_only_count)
+        af.addRow("AIS-only:", self._f_ais_only_count)
+        af.addRow("AIS-only vị trí:", self._f_ais_mode)
+        af.addRow("MMSI Country:", self._f_mid)
+        al.addLayout(af)
 
         btn_row = QHBoxLayout()
         self._btn_fusion_generate = QPushButton("Generate Fusion Scenario")
         self._btn_fusion_clear = QPushButton("Clear All")
         btn_row.addWidget(self._btn_fusion_generate)
         btn_row.addWidget(self._btn_fusion_clear)
-        layout.addLayout(btn_row)
+        al.addLayout(btn_row)
+        inner_tabs.addTab(auto_tab, "Auto Generate")
+
+        layout.addWidget(inner_tabs)
 
         self._fusion_list = QListWidget()
         layout.addWidget(self._fusion_list)
+
+        return tab
+
+    def _build_vdo_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # Enable checkbox at top
+        enable_row = QHBoxLayout()
+        self._chk_vdo = QCheckBox("Enable AIVDO  (own-ship AIS transponder)")
+        self._chk_vdo.setStyleSheet("font-weight: bold;")
+        enable_row.addWidget(self._chk_vdo)
+        enable_row.addStretch()
+        layout.addLayout(enable_row)
+
+        form = QFormLayout()
+
+        self._vdo_mmsi = QLineEdit("123456789")
+        self._vdo_mmsi.setValidator(QIntValidator(100_000_000, 999_999_999))
+        self._vdo_mmsi.setPlaceholderText("9-digit MMSI")
+
+        self._vdo_ais_class = QComboBox()
+        self._vdo_ais_class.addItems(["Class A  (Type 1 + Type 5)", "Class B  (Type 18 + Type 24)"])
+
+        self._vdo_imo = QSpinBox()
+        self._vdo_imo.setRange(0, 9_999_999)
+        self._vdo_imo.setValue(0)
+        self._vdo_imo.setToolTip("IMO number. 0 = not available. Class B không dùng.")
+        self._vdo_ais_class.currentIndexChanged.connect(
+            lambda i: self._vdo_imo.setEnabled(i == 0)
+        )
+
+        self._vdo_shipname = QLineEdit()
+        self._vdo_shipname.setPlaceholderText("Max 20 chars")
+        self._vdo_shipname.setMaxLength(20)
+
+        self._vdo_callsign = QLineEdit()
+        self._vdo_callsign.setPlaceholderText("Max 7 chars")
+        self._vdo_callsign.setMaxLength(7)
+
+        self._vdo_shiptype = QSpinBox()
+        self._vdo_shiptype.setRange(0, 99)
+        self._vdo_shiptype.setValue(0)
+        self._vdo_shiptype.setToolTip(
+            "0=N/A  30=Fishing  36=Sailing  37=Pleasure\n"
+            "50=Pilot  52=Tug  60-69=Passenger\n"
+            "70-79=Cargo  80-89=Tanker  90-99=Other"
+        )
+
+        self._vdo_destination = QLineEdit()
+        self._vdo_destination.setPlaceholderText("Max 20 chars")
+        self._vdo_destination.setMaxLength(20)
+
+        vdo_eta_row = QHBoxLayout()
+        self._vdo_eta_enabled = QCheckBox("Enable")
+        self._vdo_eta = QDateTimeEdit()
+        self._vdo_eta.setDisplayFormat("MM/dd HH:mm")
+        self._vdo_eta.setEnabled(False)
+        self._vdo_eta_enabled.toggled.connect(self._vdo_eta.setEnabled)
+        vdo_eta_row.addWidget(self._vdo_eta_enabled)
+        vdo_eta_row.addWidget(self._vdo_eta, stretch=1)
+
+        self._vdo_nav_status = QComboBox()
+        self._vdo_nav_status.addItems([
+            "0 – Under way (engine)",
+            "1 – At anchor",
+            "2 – Not under command",
+            "3 – Restricted manoeuvrability",
+            "5 – Moored",
+            "15 – Not defined",
+        ])
+
+        form.addRow("MMSI:", self._vdo_mmsi)
+        form.addRow("AIS Class:", self._vdo_ais_class)
+        form.addRow("IMO Number:", self._vdo_imo)
+        form.addRow("Ship Name:", self._vdo_shipname)
+        form.addRow("Call Sign:", self._vdo_callsign)
+        form.addRow("Ship Type:", self._vdo_shiptype)
+        form.addRow("Destination:", self._vdo_destination)
+        form.addRow("ETA (MM/dd HH:mm):", vdo_eta_row)
+        form.addRow("Nav Status:", self._vdo_nav_status)
+        layout.addLayout(form)
+
+        lbl_note = QLabel("Lat / Lon / Speed / Course / Heading — tự động sync từ GPS")
+        lbl_note.setStyleSheet("color:#90a4ae; font-style:italic;")
+        layout.addWidget(lbl_note)
+        layout.addStretch()
 
         return tab
 
@@ -731,6 +1075,53 @@ class MainWindow(QMainWindow):
         self._chk_hdg.toggled.connect(lambda v: setattr(self._gps_gen, 'send_hdg', v))
         self._chk_rot.toggled.connect(lambda v: setattr(self._gps_gen, 'send_rot', v))
         self._chk_ths.toggled.connect(lambda v: setattr(self._gps_gen, 'send_ths', v))
+        self._chk_rmb.toggled.connect(self._rmb_grp.setVisible)
+        self._chk_rmb.toggled.connect(lambda v: setattr(self._gps_gen, 'send_rmb', v))
+        self._chk_vdo.toggled.connect(lambda v: setattr(self._gps_gen, 'send_vdo', v))
+        self._vdo_mmsi.textChanged.connect(
+            lambda v: setattr(self._gps_gen, 'vdo_mmsi', int(v)) if v.isdigit() else None
+        )
+        self._vdo_ais_class.currentIndexChanged.connect(
+            lambda i: setattr(self._gps_gen, 'vdo_ais_class', 'A' if i == 0 else 'B')
+        )
+        self._vdo_nav_status.currentTextChanged.connect(
+            lambda v: setattr(self._gps_gen, 'vdo_nav_status', int(v.split(' – ')[0]))
+        )
+        self._vdo_imo.valueChanged.connect(lambda v: setattr(self._gps_gen, 'vdo_imo', v))
+        self._vdo_shipname.textChanged.connect(lambda v: setattr(self._gps_gen, 'vdo_shipname', v))
+        self._vdo_callsign.textChanged.connect(lambda v: setattr(self._gps_gen, 'vdo_callsign', v))
+        self._vdo_shiptype.valueChanged.connect(lambda v: setattr(self._gps_gen, 'vdo_shiptype', v))
+        self._vdo_destination.textChanged.connect(lambda v: setattr(self._gps_gen, 'vdo_destination', v))
+        self._vdo_eta_enabled.toggled.connect(self._on_vdo_eta_changed)
+        self._vdo_eta.dateTimeChanged.connect(self._on_vdo_eta_changed)
+        self._rmb_origin_id.textChanged.connect(lambda v: setattr(self._gps_gen, 'rmb_origin_id', v))
+        self._rmb_dest_id.textChanged.connect(lambda v: setattr(self._gps_gen, 'rmb_dest_id', v))
+        self._rmb_dest_lat.valueChanged.connect(lambda v: setattr(self._gps_gen, 'rmb_dest_lat', v))
+        self._rmb_dest_lon.valueChanged.connect(lambda v: setattr(self._gps_gen, 'rmb_dest_lon', v))
+        self._rmb_xte.valueChanged.connect(lambda v: setattr(self._gps_gen, 'rmb_xte', v))
+        self._rmb_steer.currentTextChanged.connect(lambda v: setattr(self._gps_gen, 'rmb_steer', v[0]))
+
+        # Radar computed lat/lon (live update khi thay đổi bearing/range)
+        self._r_bearing.valueChanged.connect(self._update_radar_computed_pos)
+        self._r_range.valueChanged.connect(self._update_radar_computed_pos)
+        self._btn_r_copy_latlon.clicked.connect(self._copy_radar_latlon)
+        self._btn_r_calc_bearing.clicked.connect(self._calc_bearing_from_latlon)
+
+        # OSD / RSD
+        self._chk_osd.toggled.connect(self._osd_grp.setVisible)
+        self._chk_osd.toggled.connect(lambda v: setattr(self._radar_gen, 'send_osd', v))
+        self._osd_set.valueChanged.connect(lambda v: setattr(self._radar_gen, 'osd_set', v))
+        self._osd_drift.valueChanged.connect(lambda v: setattr(self._radar_gen, 'osd_drift', v))
+        self._chk_rsd.toggled.connect(self._rsd_grp.setVisible)
+        self._chk_rsd.toggled.connect(lambda v: setattr(self._radar_gen, 'send_rsd', v))
+        self._rsd_vrm1.valueChanged.connect(lambda v: setattr(self._radar_gen, 'rsd_vrm1', v))
+        self._rsd_ebl1.valueChanged.connect(lambda v: setattr(self._radar_gen, 'rsd_ebl1', v))
+        self._rsd_vrm2.valueChanged.connect(lambda v: setattr(self._radar_gen, 'rsd_vrm2', v))
+        self._rsd_ebl2.valueChanged.connect(lambda v: setattr(self._radar_gen, 'rsd_ebl2', v))
+        self._rsd_range.valueChanged.connect(lambda v: setattr(self._radar_gen, 'rsd_range', v))
+        self._rsd_rotation.currentTextChanged.connect(
+            lambda v: setattr(self._radar_gen, 'rsd_rotation', v[0])
+        )
 
         # Radar targets
         self._btn_r_add.clicked.connect(self._on_radar_add)
@@ -747,6 +1138,7 @@ class MainWindow(QMainWindow):
         self._ais_list.itemClicked.connect(self._on_ais_item_clicked)
 
         # Fusion test
+        self._btn_fm_add.clicked.connect(self._on_fusion_manual_add)
         self._btn_fusion_generate.clicked.connect(self._on_fusion_generate)
         self._btn_fusion_clear.clicked.connect(self._on_fusion_clear)
 
@@ -849,9 +1241,9 @@ class MainWindow(QMainWindow):
         ts = QDateTime.currentDateTime().toString("HH:mm:ss.zzz")
         if "GPRMC" in msg:
             colour = _COL_GPS
-        elif "RATTM" in msg:
+        elif "RATTM" in msg or "RAOSD" in msg or "RARSD" in msg:
             colour = _COL_RADAR
-        elif "AIVDM" in msg:
+        elif "AIVDM" in msg or "AIVDO" in msg:
             colour = _COL_AIS
         else:
             colour = "#ffffff"
@@ -879,6 +1271,52 @@ class MainWindow(QMainWindow):
         )
 
     # Radar target management ---------------------------------------------
+
+    def _update_radar_computed_pos(self) -> None:
+        lat, lon = _latlon_from_bearing_range(
+            self._gps_gen.lat, self._gps_gen.lon,
+            self._r_bearing.value(), self._r_range.value(),
+        )
+        self._r_computed_lat.setText(f"{lat:.6f}")
+        self._r_computed_lon.setText(f"{lon:.6f}")
+
+    def _copy_radar_latlon(self) -> None:
+        lat = self._r_computed_lat.text()
+        lon = self._r_computed_lon.text()
+        if lat and lon:
+            QApplication.clipboard().setText(f"{lat}, {lon}")
+            self._log_info(f"Copied to clipboard: {lat}, {lon}")
+
+    def _calc_bearing_from_latlon(self) -> None:
+        from generators import _bearing_range
+        tgt_lat = self._r_input_lat.value()
+        tgt_lon = self._r_input_lon.value()
+        bearing, range_nm = _bearing_range(
+            self._gps_gen.lat, self._gps_gen.lon, tgt_lat, tgt_lon
+        )
+        # Block signals để tránh _update_radar_computed_pos ghi đè display
+        self._r_bearing.blockSignals(True)
+        self._r_range.blockSignals(True)
+        self._r_bearing.setValue(round(bearing, 4))
+        self._r_range.setValue(round(range_nm, 4))
+        self._r_bearing.blockSignals(False)
+        self._r_range.blockSignals(False)
+        # Hiển thị đúng lat/lon gốc người dùng đã nhập
+        self._r_computed_lat.setText(f"{tgt_lat:.6f}")
+        self._r_computed_lon.setText(f"{tgt_lon:.6f}")
+        self._log_info(
+            f"Lat/Lon ({tgt_lat:.6f}, {tgt_lon:.6f}) "
+            f"→ Bearing={bearing:.4f}°  Range={range_nm:.4f} NM"
+        )
+
+    def _on_vdo_eta_changed(self) -> None:
+        if self._vdo_eta_enabled.isChecked():
+            dt = self._vdo_eta.dateTime()
+            eta = (dt.date().month(), dt.date().day(),
+                   dt.time().hour(), dt.time().minute())
+        else:
+            eta = (0, 0, 24, 60)
+        self._gps_gen.vdo_eta = eta
 
     def _on_radar_add(self) -> None:
         status_map = {
@@ -949,32 +1387,151 @@ class MainWindow(QMainWindow):
                       70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
                       80, 81, 82, 83, 84, 85, 86, 87, 88, 89}
 
+    # Vùng biển/cảng/sông Việt Nam thực tế
+    # (tên, lat, lon, bán_kính_NM, loại_vùng, trọng_số)
+    # loại: 'port' | 'sea' | 'river'
+    _VIETNAM_ZONES = [
+        # ── Cảng biển lớn ──────────────────────────────────────────────────
+        ('Cảng Hải Phòng',       20.867, 106.683, 4.0,  'port',  10),
+        ('Cảng Cửa Lò (Vinh)',   18.800, 105.717, 2.5,  'port',   5),
+        ('Cảng Đà Nẵng',         16.067, 108.217, 3.0,  'port',   8),
+        ('Cảng Dung Quất',       15.400, 108.767, 2.5,  'port',   5),
+        ('Cảng Quy Nhơn',        13.767, 109.217, 2.5,  'port',   6),
+        ('Cảng Nha Trang',       12.233, 109.183, 2.0,  'port',   5),
+        ('Cảng Vũng Tàu',        10.350, 107.067, 5.0,  'port',   9),
+        ('Cảng Cát Lái (HCM)',   10.733, 106.733, 3.0,  'port',  12),
+        ('Cảng Cần Thơ',         10.050, 105.783, 2.0,  'port',   6),
+        # ── Tuyến biển ─────────────────────────────────────────────────────
+        ('Vịnh Bắc Bộ',          19.500, 107.500, 55.0, 'sea',    9),
+        ('Ven biển Trung Bộ',    15.000, 109.500, 60.0, 'sea',    8),
+        ('Ven biển Nam Trung Bộ',12.000, 110.000, 55.0, 'sea',    8),
+        ('Biển Đông (Nam)',        9.500, 110.000, 60.0, 'sea',    7),
+        ('Vịnh Thái Lan',         9.500, 103.500, 40.0, 'sea',    6),
+        ('Quần đảo Trường Sa',    9.000, 113.000, 50.0, 'sea',    3),
+        # ── Sông, vùng cửa sông ────────────────────────────────────────────
+        ('Sông Sài Gòn',         10.800, 106.720,  0.6, 'river',  7),
+        ('Sông Tiền / Sông Hậu', 10.100, 106.000,  4.0, 'river',  8),
+        ('Cửa sông Mekong',       9.600, 106.200,  3.0, 'river',  6),
+        ('Sông Hồng / Hải Phòng',20.600, 106.300,  5.0, 'river',  6),
+        ('Phá Tam Giang (Huế)',  16.500, 107.600,  2.0, 'river',  3),
+    ]
+
+    # Tàu phù hợp theo loại vùng
+    _ZONE_SHIP_TYPES = {
+        'port':  [52, 60, 70, 71, 72, 73, 74, 80, 81, 82, 83, 90],
+        'sea':   [70, 71, 72, 73, 74, 80, 81, 82, 83, 84],
+        'river': [30, 36, 37, 52, 90],
+    }
+
+    def _random_vietnam_vessel(self) -> dict:
+        """Tạo một tàu tại vị trí thực tế ở vùng biển Việt Nam."""
+        import random
+        zones = self._VIETNAM_ZONES
+        weights = [z[5] for z in zones]
+        zone = random.choices(zones, weights=weights, k=1)[0]
+        _, z_lat, z_lon, radius, z_type, _ = zone
+
+        # Vị trí ngẫu nhiên trong bán kính vùng (phân bố tròn)
+        bearing = random.uniform(0, 360)
+        range_nm = random.uniform(0, radius)
+        lat, lon = _latlon_from_bearing_range(z_lat, z_lon, bearing, range_nm)
+
+        ship_type = random.choice(self._ZONE_SHIP_TYPES[z_type])
+        ais_class = 'A' if ship_type in self._CLASS_A_TYPES else 'B'
+
+        if z_type == 'port':
+            speed = round(random.uniform(0.0, 0.3), 1)
+            nav_status = random.choice([1, 1, 5])   # chủ yếu neo/cập bến
+            heading = 511
+        elif z_type == 'sea':
+            speed = round(random.uniform(8.0, 18.0), 1)
+            nav_status = 0
+            heading = random.randint(0, 359)
+        else:  # river
+            speed = round(random.uniform(2.0, 8.0), 1)
+            nav_status = 0
+            heading = random.randint(0, 359)
+
+        cog = round(random.uniform(0, 360), 1)
+
+        # MMSI: cảng/sông → Việt Nam (574); biển → đa quốc gia
+        if z_type == 'sea':
+            mid_pool = [574, 574, 574, 413, 431, 440, 563, 533, 338]
+            mid = random.choice(mid_pool)
+        else:
+            mid = 574
+
+        return {
+            'lat': round(lat, 6), 'lon': round(lon, 6),
+            'speed': speed, 'cog': cog, 'heading': heading,
+            'nav_status': nav_status, 'ship_type': ship_type,
+            'ais_class': ais_class, 'mid': mid, 'zone_type': z_type,
+        }
+
     def _on_ais_auto_generate(self) -> None:
         import random
         count = self._a_auto_count.value()
-        ship_types = [30, 36, 52, 60, 70, 80, 90]
+        vietnam_mode = self._a_auto_mode.currentIndex() == 1
+
         for _ in range(count):
-            shiptype = random.choice(ship_types)
-            ais_class = 'A' if shiptype in self._CLASS_A_TYPES else 'B'
-            mmsi = self._new_mmsi(mid=0)
             idx = len(self._ais_gen.vessels) + 1
-            lat = self._gps_gen.lat + random.uniform(-0.15, 0.15)
-            lon = self._gps_gen.lon + random.uniform(-0.15, 0.15)
-            imo = random.randint(1_000_000, 9_999_999) if ais_class == 'A' else 0
-            self._ais_gen.add_or_update_vessel(
-                mmsi=mmsi,
-                lat=round(lat, 6),
-                lon=round(lon, 6),
-                sog=round(random.uniform(0, 18), 1),
-                cog=round(random.uniform(0, 360), 1),
-                heading=random.randint(0, 359),
-                nav_status=0,
-                shipname=f'VESSEL {idx:02d}',
-                shiptype=shiptype,
-                callsign=f'{mmsi // 1_000_000:03d}{mmsi % 1_000:03d}',
-                imo=imo,
-                ais_class=ais_class,
-            )
+
+            if vietnam_mode:
+                v = self._random_vietnam_vessel()
+                mmsi = self._new_mmsi(mid=v['mid'])
+                imo = random.randint(1_000_000, 9_999_999) if v['ais_class'] == 'A' else 0
+                self._ais_gen.add_or_update_vessel(
+                    mmsi=mmsi,
+                    lat=v['lat'], lon=v['lon'],
+                    sog=v['speed'], cog=v['cog'], heading=v['heading'],
+                    nav_status=v['nav_status'],
+                    shipname=f'VN {idx:04d}',
+                    shiptype=v['ship_type'],
+                    callsign=f'{mmsi // 1_000_000:03d}{mmsi % 1_000:03d}',
+                    imo=imo, ais_class=v['ais_class'],
+                )
+            else:
+                # Phân bố theo cự ly thực tế như AIS/Radar trên tàu thật
+                band = random.choices(
+                    ['near', 'mid', 'far'],
+                    weights=[25, 45, 30]
+                )[0]
+                if band == 'near':       # 0.3–5 NM: tàu nhỏ, tàu cá, tàu kéo
+                    range_nm = random.uniform(0.3, 5.0)
+                    ship_types = [30, 36, 37, 52, 90]
+                    sog = round(random.uniform(0, 8), 1)
+                    nav_status = random.choice([0, 0, 1])
+                elif band == 'mid':      # 5–20 NM: tàu hàng, tàu khách hỗn hợp
+                    range_nm = random.uniform(5.0, 20.0)
+                    ship_types = [52, 60, 70, 71, 72, 80, 81, 90]
+                    sog = round(random.uniform(4, 15), 1)
+                    nav_status = 0
+                else:                    # 20–40 NM: tàu lớn trên tuyến biển
+                    range_nm = random.uniform(20.0, 40.0)
+                    ship_types = [70, 71, 72, 73, 74, 80, 81, 82, 83, 84]
+                    sog = round(random.uniform(10, 18), 1)
+                    nav_status = 0
+
+                shiptype = random.choice(ship_types)
+                ais_class = 'A' if shiptype in self._CLASS_A_TYPES else 'B'
+                mmsi = self._new_mmsi(mid=0)
+                bearing = random.uniform(0, 360)
+                lat, lon = _latlon_from_bearing_range(
+                    self._gps_gen.lat, self._gps_gen.lon, bearing, range_nm
+                )
+                cog = round(random.uniform(0, 360), 1)
+                heading = int(cog) % 360 if sog > 0.5 else 511
+                imo = random.randint(1_000_000, 9_999_999) if ais_class == 'A' else 0
+                self._ais_gen.add_or_update_vessel(
+                    mmsi=mmsi,
+                    lat=round(lat, 6), lon=round(lon, 6),
+                    sog=sog, cog=cog, heading=heading,
+                    nav_status=nav_status,
+                    shipname=f'VESSEL {idx:04d}',
+                    shiptype=shiptype,
+                    callsign=f'{mmsi // 1_000_000:03d}{mmsi % 1_000:03d}',
+                    imo=imo, ais_class=ais_class,
+                )
         self._refresh_ais_list()
 
     def _on_ais_clear(self) -> None:
@@ -1092,6 +1649,15 @@ class MainWindow(QMainWindow):
                 f"{n} client{'s' if n != 1 else ''} connected"
             )
 
+        # Cập nhật lat/lon tuyệt đối của radar target theo vị trí GPS hiện tại
+        self._update_radar_computed_pos()
+
+        # Sync OSD own-ship values from GPS generator
+        if self._chk_osd.isChecked():
+            self._radar_gen.osd_heading = self._gps_gen.heading_true
+            self._radar_gen.osd_course = self._gps_gen.course
+            self._radar_gen.osd_speed = self._gps_gen.speed
+
         # GPS spinboxes
         self._gps_lat.blockSignals(True)
         self._gps_lon.blockSignals(True)
@@ -1166,8 +1732,66 @@ class MainWindow(QMainWindow):
                 return mmsi
         raise RuntimeError("Cannot generate a unique MMSI")
 
+    def _on_fusion_manual_add(self) -> None:
+        import random
+        mmsi_text = self._fm_mmsi.text().strip()
+        if not mmsi_text.isdigit() or len(mmsi_text) != 9:
+            QMessageBox.warning(self, "MMSI không hợp lệ", "MMSI phải là đúng 9 chữ số.")
+            return
+
+        tid      = self._fm_target_id.value()
+        bearing  = self._fm_bearing.value()
+        range_nm = self._fm_range.value()
+        speed    = self._fm_speed.value()
+        course   = self._fm_course.value()
+        name     = self._fm_name.text().strip() or f'FUS{tid:02d}'
+        mmsi     = int(mmsi_text)
+        shiptype = self._fm_shiptype.value()
+        ais_class = 'A' if self._fm_ais_class.currentIndex() == 0 else 'B'
+        nav_raw  = self._fm_nav_status.currentText().split(' – ')[0].strip()
+        nav_status = int(nav_raw)
+
+        # Sync own-ship reference
+        self._radar_gen.own_lat = self._gps_gen.lat
+        self._radar_gen.own_lon = self._gps_gen.lon
+
+        # Radar target
+        self._radar_gen.add_or_update_target(
+            target_id=tid, bearing=bearing, range_nm=range_nm,
+            speed=speed, course=course, status='T', name=name,
+        )
+
+        # AIS vessel tại đúng lat/lon tính từ bearing + range
+        lat, lon = _latlon_from_bearing_range(
+            self._gps_gen.lat, self._gps_gen.lon, bearing, range_nm
+        )
+        heading = int(course) % 360 if speed > 0.5 else 511
+        imo = random.randint(1_000_000, 9_999_999) if ais_class == 'A' else 0
+        self._ais_gen.add_or_update_vessel(
+            mmsi=mmsi, lat=round(lat, 6), lon=round(lon, 6),
+            sog=speed, cog=course, heading=heading,
+            nav_status=nav_status, shipname=name, shiptype=shiptype,
+            callsign=f'{mmsi // 1_000_000:03d}{mmsi % 1_000:03d}',
+            imo=imo, ais_class=ais_class,
+        )
+
+        # Xoá entry cũ nếu trùng tid hoặc mmsi, rồi thêm mới
+        self._fusion_entries = [
+            e for e in self._fusion_entries
+            if not (e.get('tid') == tid or e.get('mmsi') == mmsi)
+        ]
+        self._fusion_entries.append({'type': 'FUSED', 'tid': tid, 'mmsi': mmsi})
+
+        self._refresh_radar_list()
+        self._refresh_ais_list()
+        self._refresh_fusion_list()
+        self._log_info(f"Manual fused: Radar#{tid} ↔ MMSI={mmsi}  [{name}]")
+
     def _on_fusion_generate(self) -> None:
         import random
+        # Sync own-ship reference so radar and AIS targets share the same origin
+        self._radar_gen.own_lat = self._gps_gen.lat
+        self._radar_gen.own_lon = self._gps_gen.lon
         self._radar_gen.targets.clear()
         self._ais_gen.vessels.clear()
         self._fusion_entries = []
@@ -1234,29 +1858,58 @@ class MainWindow(QMainWindow):
             self._fusion_entries.append({'type': 'RADAR', 'tid': tid})
             tid += 1
 
+        vietnam_ais = self._f_ais_mode.currentIndex() == 1
         for i in range(ais_only_count):
-            mmsi = self._new_mmsi()
-            lat = round(self._gps_gen.lat + random.uniform(-0.2, 0.2), 6)
-            lon = round(self._gps_gen.lon + random.uniform(-0.2, 0.2), 6)
-            sog = round(random.uniform(0, 18), 1)
-            cog = round(random.uniform(0, 360), 1)
-            # AIS-only: mix Class A and B (small vessels, fishing, sailing)
-            ao_shiptype = random.choice([30, 36, 37, 52, 90])
-            ao_class = 'A' if ao_shiptype in self._CLASS_A_TYPES else 'B'
-            self._ais_gen.add_or_update_vessel(
-                mmsi=mmsi,
-                lat=lat,
-                lon=lon,
-                sog=sog,
-                cog=cog,
-                heading=511,
-                nav_status=0,
-                shipname=f'AIS{i + 1:02d}',
-                shiptype=ao_shiptype,
-                callsign=f'{mmsi // 1_000_000:03d}{mmsi % 1_000:03d}',
-                imo=random.randint(1_000_000, 9_999_999) if ao_class == 'A' else 0,
-                ais_class=ao_class,
-            )
+            if vietnam_ais:
+                v = self._random_vietnam_vessel()
+                mmsi = self._new_mmsi(mid=v['mid'])
+                self._ais_gen.add_or_update_vessel(
+                    mmsi=mmsi,
+                    lat=v['lat'], lon=v['lon'],
+                    sog=v['speed'], cog=v['cog'], heading=v['heading'],
+                    nav_status=v['nav_status'],
+                    shipname=f'AIS{i + 1:03d}',
+                    shiptype=v['ship_type'],
+                    callsign=f'{mmsi // 1_000_000:03d}{mmsi % 1_000:03d}',
+                    imo=random.randint(1_000_000, 9_999_999) if v['ais_class'] == 'A' else 0,
+                    ais_class=v['ais_class'],
+                )
+            else:
+                mmsi = self._new_mmsi()
+                band = random.choices(['near', 'mid', 'far'], weights=[25, 45, 30])[0]
+                if band == 'near':
+                    range_nm = random.uniform(0.3, 5.0)
+                    ao_shiptype = random.choice([30, 36, 37, 52, 90])
+                    sog = round(random.uniform(0, 8), 1)
+                    nav_status = random.choice([0, 0, 1])
+                elif band == 'mid':
+                    range_nm = random.uniform(5.0, 20.0)
+                    ao_shiptype = random.choice([52, 60, 70, 71, 72, 80, 81, 90])
+                    sog = round(random.uniform(4, 15), 1)
+                    nav_status = 0
+                else:
+                    range_nm = random.uniform(20.0, 40.0)
+                    ao_shiptype = random.choice([70, 71, 72, 73, 80, 81, 82, 83])
+                    sog = round(random.uniform(10, 18), 1)
+                    nav_status = 0
+                ao_class = 'A' if ao_shiptype in self._CLASS_A_TYPES else 'B'
+                bearing = random.uniform(0, 360)
+                lat, lon = _latlon_from_bearing_range(
+                    self._gps_gen.lat, self._gps_gen.lon, bearing, range_nm
+                )
+                cog = round(random.uniform(0, 360), 1)
+                self._ais_gen.add_or_update_vessel(
+                    mmsi=mmsi,
+                    lat=round(lat, 6), lon=round(lon, 6),
+                    sog=sog, cog=cog,
+                    heading=int(cog) % 360 if sog > 0.5 else 511,
+                    nav_status=nav_status,
+                    shipname=f'AIS{i + 1:03d}',
+                    shiptype=ao_shiptype,
+                    callsign=f'{mmsi // 1_000_000:03d}{mmsi % 1_000:03d}',
+                    imo=random.randint(1_000_000, 9_999_999) if ao_class == 'A' else 0,
+                    ais_class=ao_class,
+                )
             self._fusion_entries.append({'type': 'AIS', 'mmsi': mmsi})
 
         self._refresh_radar_list()
