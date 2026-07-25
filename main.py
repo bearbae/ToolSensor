@@ -501,6 +501,27 @@ class MainWindow(QMainWindow):
         latlon_grp.setStyleSheet("QGroupBox { color: #0d6efd; font-weight: bold; }")
         latlon_vl = QVBoxLayout(latlon_grp)
 
+        # Own-ship reference (có thể nhập tay khi không bắn GPS)
+        row_ownship = QHBoxLayout()
+        row_ownship.addWidget(QLabel("Own-ship:"))
+        self._r_own_lat = QDoubleSpinBox()
+        self._r_own_lat.setRange(-90.0, 90.0)
+        self._r_own_lat.setDecimals(6)
+        self._r_own_lat.setPrefix("Lat ")
+        self._r_own_lat.setToolTip("Lat tàu chủ dùng để tính Bearing+Range. Nhập tay hoặc bấm '← GPS' để kéo từ GPS.")
+        self._r_own_lon = QDoubleSpinBox()
+        self._r_own_lon.setRange(-180.0, 180.0)
+        self._r_own_lon.setDecimals(6)
+        self._r_own_lon.setPrefix("Lon ")
+        self._r_own_lon.setToolTip("Lon tàu chủ dùng để tính Bearing+Range. Nhập tay hoặc bấm '← GPS' để kéo từ GPS.")
+        self._btn_sync_gps = QPushButton("← GPS")
+        self._btn_sync_gps.setFixedWidth(60)
+        self._btn_sync_gps.setToolTip("Kéo vị trí GPS hiện tại vào ô Own-ship")
+        row_ownship.addWidget(self._r_own_lat, stretch=1)
+        row_ownship.addWidget(self._r_own_lon, stretch=1)
+        row_ownship.addWidget(self._btn_sync_gps)
+        latlon_vl.addLayout(row_ownship)
+
         # Chiều 1: Bearing+Range → Lat/Lon (tính từ form trên)
         row_br2ll = QHBoxLayout()
         row_br2ll.addWidget(QLabel("Brg+Rng → "))
@@ -1101,11 +1122,14 @@ class MainWindow(QMainWindow):
         self._rmb_xte.valueChanged.connect(lambda v: setattr(self._gps_gen, 'rmb_xte', v))
         self._rmb_steer.currentTextChanged.connect(lambda v: setattr(self._gps_gen, 'rmb_steer', v[0]))
 
-        # Radar computed lat/lon (live update khi thay đổi bearing/range)
+        # Radar computed lat/lon (live update khi thay đổi bearing/range hoặc own-ship)
         self._r_bearing.valueChanged.connect(self._update_radar_computed_pos)
         self._r_range.valueChanged.connect(self._update_radar_computed_pos)
+        self._r_own_lat.valueChanged.connect(self._update_radar_computed_pos)
+        self._r_own_lon.valueChanged.connect(self._update_radar_computed_pos)
         self._btn_r_copy_latlon.clicked.connect(self._copy_radar_latlon)
         self._btn_r_calc_bearing.clicked.connect(self._calc_bearing_from_latlon)
+        self._btn_sync_gps.clicked.connect(self._sync_ownship_from_gps)
 
         # OSD / RSD
         self._chk_osd.toggled.connect(self._osd_grp.setVisible)
@@ -1273,12 +1297,18 @@ class MainWindow(QMainWindow):
     # Radar target management ---------------------------------------------
 
     def _update_radar_computed_pos(self) -> None:
+        own_lat = self._r_own_lat.value()
+        own_lon = self._r_own_lon.value()
         lat, lon = _latlon_from_bearing_range(
-            self._gps_gen.lat, self._gps_gen.lon,
+            own_lat, own_lon,
             self._r_bearing.value(), self._r_range.value(),
         )
         self._r_computed_lat.setText(f"{lat:.6f}")
         self._r_computed_lon.setText(f"{lon:.6f}")
+
+    def _sync_ownship_from_gps(self) -> None:
+        self._r_own_lat.setValue(self._gps_gen.lat)
+        self._r_own_lon.setValue(self._gps_gen.lon)
 
     def _copy_radar_latlon(self) -> None:
         lat = self._r_computed_lat.text()
@@ -1289,10 +1319,12 @@ class MainWindow(QMainWindow):
 
     def _calc_bearing_from_latlon(self) -> None:
         from generators import _bearing_range
+        own_lat = self._r_own_lat.value()
+        own_lon = self._r_own_lon.value()
         tgt_lat = self._r_input_lat.value()
         tgt_lon = self._r_input_lon.value()
         bearing, range_nm = _bearing_range(
-            self._gps_gen.lat, self._gps_gen.lon, tgt_lat, tgt_lon
+            own_lat, own_lon, tgt_lat, tgt_lon
         )
         # Block signals để tránh _update_radar_computed_pos ghi đè display
         self._r_bearing.blockSignals(True)
