@@ -281,9 +281,16 @@ class ConnectionRow(QGroupBox):
 
             folder = self._get_folder()
             prefix = self._prefix.text().strip() or "session"
-            self._logger = SessionLogger(folder, prefix,
-                                         daily_rotate=self._get_daily_rot())
-            self._last_path = self._logger.path
+            if self._last_path and os.path.exists(self._last_path):
+                # Kết nối lại → ghi tiếp vào file cũ
+                self._logger = SessionLogger(folder, prefix,
+                                             existing_path=self._last_path,
+                                             daily_rotate=self._get_daily_rot())
+            else:
+                # Lần đầu kết nối → tạo file mới
+                self._logger = SessionLogger(folder, prefix,
+                                             daily_rotate=self._get_daily_rot())
+                self._last_path = self._logger.path
             self._lbl_file.setText(os.path.basename(self._logger.path))
             self._lbl_status.setText("Đang kết nối…")
             self._dot.setStyleSheet("color:#ffc107; font-size:13px;")
