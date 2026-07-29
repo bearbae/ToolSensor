@@ -2,6 +2,7 @@
 
 import socket
 import threading
+import time
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -36,11 +37,12 @@ class ReceiverThread(QThread):
             if self._mode == 'serial':
                 self._run_serial()
             elif self._mode == 'tcp_client':
-                self._run_tcp_client()
+                self._run_tcp_client()   # tự xử lý retry bên trong
             elif self._mode == 'tcp_server':
                 self._run_tcp_server()
         except Exception as exc:
-            self.error.emit(str(exc))
+            if self._running:            # chỉ báo lỗi khi không phải do stop()
+                self.error.emit(str(exc))
 
     # ── helpers ─────────────────────────────────────────────────────────────
 
@@ -57,41 +59,80 @@ class ReceiverThread(QThread):
             self._emit(line)
         return buf
 
-    # ── serial ──────────────────────────────────────────────────────────────
+    # ── serial (có tự động kết nối lại) ────────────────────────────────────
 
     def _run_serial(self) -> None:
         import serial
         port = self._kwargs['port']
         baud = self._kwargs.get('baud', 4800)
-        with serial.Serial(port, baud, timeout=1) as ser:
-            self.status_changed.emit(f"Serial {port} @ {baud} baud")
-            raw_buf = b''
-            while self._running:
-                data = ser.read(256)
-                if data:
-                    raw_buf += data
-                    while b'\n' in raw_buf:
-                        line_b, raw_buf = raw_buf.split(b'\n', 1)
-                        self._emit(line_b.decode('ascii', errors='replace'))
 
-    # ── TCP client ──────────────────────────────────────────────────────────
+        while self._running:
+            try:
+                self.status_changed.emit(f"Đang mở cổng {port}…")
+                with serial.Serial(port, baud, timeout=1) as ser:
+                    self.status_changed.emit(f"Serial {port} @ {baud} baud")
+                    raw_buf = b''
+                    while self._running:
+                        try:
+                            data = ser.read(256)
+                            if data:
+                                raw_buf += data
+                                while b'\n' in raw_buf:
+                                    line_b, raw_buf = raw_buf.split(b'\n', 1)
+                                    self._emit(line_b.decode('ascii', errors='replace'))
+                        except serial.SerialException as exc:
+                            self.status_changed.emit(
+                                f"Lỗi Serial: {exc}, thử lại sau {self._RETRY_DELAY}s…"
+                            )
+                            break
+            except Exception as exc:
+                if not self._running:
+                    break
+                self.status_changed.emit(
+                    f"Không mở được {port}: {exc}, thử lại sau {self._RETRY_DELAY}s…"
+                )
+
+            for _ in range(self._RETRY_DELAY * 2):
+                if not self._running:
+                    return
+                time.sleep(0.5)
+
+    # ── TCP client (có tự động kết nối lại) ────────────────────────────────
+
+    _RETRY_DELAY = 5   # giây chờ giữa các lần thử lại
 
     def _run_tcp_client(self) -> None:
         host = self._kwargs['host']
         port = self._kwargs['port']
-        with socket.create_connection((host, port), timeout=5) as sock:
-            sock.settimeout(1.0)
-            self.status_changed.emit(f"TCP Client connected to {host}:{port}")
-            buf = ''
-            while self._running:
-                try:
-                    data = sock.recv(4096).decode('ascii', errors='replace')
-                    if not data:
-                        self.status_changed.emit("TCP server closed connection")
-                        break
-                    buf = self._split_lines(buf, data)
-                except socket.timeout:
-                    continue
+
+        while self._running:
+            try:
+                self.status_changed.emit(f"Đang kết nối {host}:{port}…")
+                with socket.create_connection((host, port), timeout=5) as sock:
+                    sock.settimeout(1.0)
+                    self.status_changed.emit(f"Đã kết nối {host}:{port}")
+                    buf = ''
+                    while self._running:
+                        try:
+                            data = sock.recv(4096).decode('ascii', errors='replace')
+                            if not data:
+                                self.status_changed.emit("Bên phát ngắt kết nối, đang thử lại…")
+                                break
+                            buf = self._split_lines(buf, data)
+                        except socket.timeout:
+                            continue
+            except OSError as exc:
+                if not self._running:
+                    break
+                self.status_changed.emit(
+                    f"Kết nối thất bại ({exc.strerror}), thử lại sau {self._RETRY_DELAY}s…"
+                )
+
+            # Chờ trước khi thử lại — kiểm tra _running mỗi 0.5s
+            for _ in range(self._RETRY_DELAY * 2):
+                if not self._running:
+                    return
+                time.sleep(0.5)
 
     # ── TCP server ──────────────────────────────────────────────────────────
 
