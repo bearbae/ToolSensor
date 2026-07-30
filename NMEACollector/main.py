@@ -9,7 +9,8 @@ import sys
 from datetime import datetime
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QFont, QTextCursor
+from PyQt6.QtGui import QFont, QIcon, QTextCursor
+from PyQt6.QtWidgets import QMenu, QSystemTrayIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -376,6 +377,7 @@ class MainWindow(QMainWindow):
         self._log_line_count = 0
 
         self._build_ui()
+        self._build_tray()
         self._load_config_to_ui()
 
         self._timer = QTimer(self)
@@ -686,11 +688,67 @@ class MainWindow(QMainWindow):
         self._stat_labels.clear()
         self._log_line_count = 0
 
+    # ── System tray ───────────────────────────────────────────────────────
+
+    def _build_tray(self):
+        # Khi đóng gói PyInstaller --onefile, file tạm được giải nén vào sys._MEIPASS
+        if getattr(sys, 'frozen', False):
+            base_dir = sys._MEIPASS
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(base_dir, "icon.ico")
+        icon = QIcon(icon_path) if os.path.exists(icon_path) else self.style().standardIcon(
+            self.style().StandardPixmap.SP_ComputerIcon
+        )
+
+        # Gán icon cho cửa sổ chính và thanh taskbar
+        self.setWindowIcon(icon)
+        QApplication.instance().setWindowIcon(icon)
+
+        self._tray = QSystemTrayIcon(icon, self)
+        self._tray.setToolTip("NMEA Collector — đang chạy ngầm")
+
+        menu = QMenu()
+        act_show = menu.addAction("Hiển thị / Ẩn")
+        act_show.triggered.connect(self._toggle_window)
+        menu.addSeparator()
+        act_quit = menu.addAction("Thoát")
+        act_quit.triggered.connect(self._quit_app)
+        self._tray.setContextMenu(menu)
+
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.show()
+
+    def _toggle_window(self):
+        if self.isVisible():
+            self.hide()
+        else:
+            self.show()
+            self.activateWindow()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._toggle_window()
+
+    def _quit_app(self):
+        self._disconnect_all()
+        QApplication.quit()
+
     # ── Close ─────────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
-        self._disconnect_all()
-        event.accept()
+        if hasattr(self, '_tray') and self._tray.isVisible():
+            self.hide()
+            self._tray.showMessage(
+                "NMEA Collector",
+                "Đang chạy ngầm. Double-click vào biểu tượng dưới thanh taskbar để mở lại.",
+                QSystemTrayIcon.MessageIcon.Information,
+                2500,
+            )
+            event.ignore()
+        else:
+            self._disconnect_all()
+            event.accept()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
