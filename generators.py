@@ -67,6 +67,54 @@ def _bearing_range(own_lat: float, own_lon: float,
     return bearing, range_nm
 
 
+def _advance_along_route(vessel: dict, dt_hours: float) -> None:
+    """Advance vessel position along its pre-loaded GPX route."""
+    route = vessel['_route']
+    n = len(route)
+    if n < 2 or vessel.get('_route_done'):
+        return
+
+    idx = vessel.get('_route_idx', 0)
+    loop = vessel.get('_route_loop', False)
+    remaining_nm = vessel['sog'] * dt_hours
+    lat, lon = vessel['lat'], vessel['lon']
+
+    while remaining_nm > 1e-6:
+        next_idx = (idx + 1) % n if loop else idx + 1
+        if not loop and next_idx >= n:
+            vessel['_route_done'] = True
+            lat, lon = route[-1]
+            idx = n - 1
+            break
+
+        next_lat, next_lon = route[next_idx]
+        brg, dist = _bearing_range(lat, lon, next_lat, next_lon)
+
+        if dist < 1e-4:          # essentially at waypoint, skip ahead
+            idx = next_idx
+            continue
+
+        if remaining_nm >= dist:
+            remaining_nm -= dist
+            lat, lon = next_lat, next_lon
+            idx = next_idx
+        else:
+            spd = max(vessel['sog'], 0.001)
+            lat, lon = _move(lat, lon, brg, spd, remaining_nm / spd)
+            remaining_nm = 0
+
+    vessel['lat'] = lat
+    vessel['lon'] = lon
+    vessel['_route_idx'] = idx
+
+    # Keep COG pointed at next waypoint
+    next_idx = (idx + 1) % n if loop else min(idx + 1, n - 1)
+    if next_idx != idx:
+        brg, _ = _bearing_range(lat, lon, route[next_idx][0], route[next_idx][1])
+        vessel['cog'] = brg
+        vessel['heading'] = int(brg) % 360
+
+
 def _latlon_from_bearing_range(own_lat: float, own_lon: float,
                                 bearing_deg: float, range_nm: float) -> tuple:
     """Return absolute (lat, lon) of a point at bearing/range from own ship."""
@@ -527,7 +575,12 @@ class AISGenerator:
         imo: int = 0,                  # IMO number 1000000–9999999; 0 = not available
         ais_class: str = 'A',          # 'A' → Type 1+5;  'B' → Type 18+24A+24B
     ) -> None:
-        self.vessels[mmsi] = {
+        existing = self.vessels.get(mmsi, {})
+        # Keep current position when vessel is on a route (don't teleport it)
+        if existing.get('_route'):
+            lat = existing['lat']
+            lon = existing['lon']
+        new_vessel: dict = {
             'lat': lat,
             'lon': lon,
             'sog': sog,
@@ -542,9 +595,37 @@ class AISGenerator:
             'imo': imo,
             'ais_class': ais_class,
         }
+        # Preserve route state and static-message timing from existing vessel
+        for key in ('_route', '_route_idx', '_route_loop', '_route_done', '_last_static_t'):
+            if key in existing:
+                new_vessel[key] = existing[key]
+        self.vessels[mmsi] = new_vessel
 
     def remove_vessel(self, mmsi: int) -> None:
         self.vessels.pop(mmsi, None)
+
+    def set_vessel_route(self, mmsi: int, waypoints: list, loop: bool = False) -> None:
+        """Attach a GPX route to a vessel; position resets to first waypoint."""
+        v = self.vessels.get(mmsi)
+        if v is None or len(waypoints) < 2:
+            return
+        v['_route'] = list(waypoints)
+        v['_route_idx'] = 0
+        v['_route_loop'] = loop
+        v['_route_done'] = False
+        v['lat'], v['lon'] = waypoints[0]
+        if len(waypoints) > 1:
+            brg, _ = _bearing_range(waypoints[0][0], waypoints[0][1],
+                                    waypoints[1][0], waypoints[1][1])
+            v['cog'] = brg
+            v['heading'] = int(brg) % 360
+
+    def clear_vessel_route(self, mmsi: int) -> None:
+        v = self.vessels.get(mmsi)
+        if v is None:
+            return
+        for key in ('_route', '_route_idx', '_route_loop', '_route_done'):
+            v.pop(key, None)
 
     def _build_type5_bits(self, mmsi: int, vessel: dict) -> list:
         """Build 424-bit AIS Type 5 (static & voyage data) payload."""
@@ -720,10 +801,13 @@ class AISGenerator:
 
         messages = []
         for mmsi, vessel in self.vessels.items():
-            vessel['lat'], vessel['lon'] = _move(
-                vessel['lat'], vessel['lon'],
-                vessel['cog'], vessel['sog'], dt
-            )
+            if vessel.get('_route'):
+                _advance_along_route(vessel, dt)
+            else:
+                vessel['lat'], vessel['lon'] = _move(
+                    vessel['lat'], vessel['lon'],
+                    vessel['cog'], vessel['sog'], dt
+                )
 
             # Determine whether static data is due this cycle.
             # _last_static_t = 0 means never sent → send immediately.

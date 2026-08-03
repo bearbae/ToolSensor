@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDateTimeEdit,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -34,6 +35,7 @@ from PyQt6.QtWidgets import (
 )
 
 from generators import AISGenerator, GPSGenerator, RadarTTMGenerator, _latlon_from_bearing_range
+from gpx_parser import parse_gpx
 from transmitters import (
     SerialTransmitter,
     TCPServerTransmitter,
@@ -111,6 +113,9 @@ class MainWindow(QMainWindow):
         self._transmitter = None
         self._thread: TransmitterThread | None = None
         self._fusion_entries: list = []
+
+        self._a_gpx_pending: list | None = None        # waypoints đang chờ gán cho vessel
+        self._ais_vessel_routes: dict[int, list] = {}  # mmsi → waypoints
 
         self._gps_display_timer = QTimer(self)
         self._gps_display_timer.setInterval(500)
@@ -685,7 +690,7 @@ class MainWindow(QMainWindow):
         self._a_lon.setValue(106.700900)
 
         self._a_sog = QDoubleSpinBox()
-        self._a_sog.setRange(0.0, 102.2)
+        self._a_sog.setRange(0.0, 9999.0)
         self._a_sog.setDecimals(1)
         self._a_sog.setSuffix(" kn")
 
@@ -774,6 +779,33 @@ class MainWindow(QMainWindow):
         ab_row.addWidget(self._btn_a_add)
         ab_row.addWidget(self._btn_a_remove)
         at_layout.addLayout(ab_row)
+
+        # GPX Route group
+        gpx_grp = QGroupBox("GPX Route")
+        gpx_lay = QVBoxLayout(gpx_grp)
+        gpx_lay.setSpacing(4)
+
+        gpx_file_row = QHBoxLayout()
+        self._a_gpx_label = QLabel("Chưa chọn file")
+        self._a_gpx_label.setStyleSheet("color:#90a4ae; font-style:italic;")
+        self._btn_a_gpx_load = QPushButton("Tải GPX")
+        self._btn_a_gpx_load.setFixedWidth(76)
+        self._btn_a_gpx_clear_file = QPushButton("✕")
+        self._btn_a_gpx_clear_file.setFixedWidth(28)
+        gpx_file_row.addWidget(self._a_gpx_label, stretch=1)
+        gpx_file_row.addWidget(self._btn_a_gpx_load)
+        gpx_file_row.addWidget(self._btn_a_gpx_clear_file)
+        gpx_lay.addLayout(gpx_file_row)
+
+        gpx_opt_row = QHBoxLayout()
+        self._a_gpx_loop = QCheckBox("Lặp lại route")
+        self._a_gpx_status = QLabel("—")
+        self._a_gpx_status.setStyleSheet("color:#90a4ae;")
+        gpx_opt_row.addWidget(self._a_gpx_loop)
+        gpx_opt_row.addStretch()
+        gpx_opt_row.addWidget(self._a_gpx_status)
+        gpx_lay.addLayout(gpx_opt_row)
+        at_layout.addWidget(gpx_grp)
 
         # Auto generate row
         a_auto_row = QHBoxLayout()
@@ -1161,6 +1193,8 @@ class MainWindow(QMainWindow):
         self._btn_a_auto.clicked.connect(self._on_ais_auto_generate)
         self._btn_a_clear.clicked.connect(self._on_ais_clear)
         self._ais_list.itemClicked.connect(self._on_ais_item_clicked)
+        self._btn_a_gpx_load.clicked.connect(self._on_ais_gpx_load)
+        self._btn_a_gpx_clear_file.clicked.connect(self._on_ais_gpx_clear_file)
 
         # Fusion test
         self._btn_fm_add.clicked.connect(self._on_fusion_manual_add)
@@ -1621,6 +1655,23 @@ class MainWindow(QMainWindow):
             imo=self._a_imo.value() if ais_class == 'A' else 0,
             ais_class=ais_class,
         )
+        if self._a_gpx_pending is not None:
+            # User tải GPX mới tường minh → gán route + reset vị trí về đầu route
+            self._ais_gen.set_vessel_route(
+                new_mmsi, self._a_gpx_pending, self._a_gpx_loop.isChecked()
+            )
+            self._ais_vessel_routes[new_mmsi] = self._a_gpx_pending
+            self._a_gpx_pending = None
+            fname = self._a_gpx_label.text()
+            self._a_gpx_label.setText(f"Đã gán — {fname}")
+        elif new_mmsi in self._ais_vessel_routes:
+            # Route đang chạy → add_or_update_vessel đã giữ nguyên _route trong dict;
+            # chỉ cập nhật loop flag nếu user thay đổi
+            v_live = self._ais_gen.vessels.get(new_mmsi)
+            if v_live:
+                v_live['_route_loop'] = self._a_gpx_loop.isChecked()
+        else:
+            self._ais_gen.clear_vessel_route(new_mmsi)
         self._refresh_ais_list()
         self._refresh_fusion_list()
 
@@ -1629,6 +1680,7 @@ class MainWindow(QMainWindow):
         if items:
             mmsi = int(items[0].text().split()[0])
             self._ais_gen.remove_vessel(mmsi)
+            self._ais_vessel_routes.pop(mmsi, None)
             self._refresh_ais_list()
             self._refresh_fusion_list()
 
@@ -1659,14 +1711,68 @@ class MainWindow(QMainWindow):
             self._a_eta.setDateTime(
                 QDateTime(2000, eta[0] or 1, eta[1] or 1, eta[2], eta[3])
             )
+        # Khôi phục GPX state — KHÔNG set _a_gpx_pending từ route cũ;
+        # user phải tải file GPX mới tường minh để thay đổi route
+        self._a_gpx_pending = None
+        route = self._ais_vessel_routes.get(mmsi)
+        if route:
+            idx = v.get('_route_idx', 0)
+            n = len(route)
+            self._a_gpx_label.setText(f"Route đã gán ({n} điểm)")
+            self._a_gpx_label.setStyleSheet("color:#00e676;")
+            self._a_gpx_loop.setChecked(v.get('_route_loop', False))
+            done = v.get('_route_done', False)
+            self._a_gpx_status.setText(
+                f"Đã đến điểm cuối ({n}/{n})" if done else f"Waypoint {idx + 1}/{n}"
+            )
+        else:
+            self._a_gpx_label.setText("Chưa chọn file")
+            self._a_gpx_label.setStyleSheet("color:#90a4ae; font-style:italic;")
+            self._a_gpx_status.setText("—")
+
+    def _on_ais_gpx_load(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Chọn file GPX", "", "GPX Files (*.gpx);;All Files (*)"
+        )
+        if not path:
+            return
+        try:
+            wpts = parse_gpx(path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Lỗi GPX", f"Không đọc được file:\n{exc}")
+            return
+        if len(wpts) < 2:
+            QMessageBox.warning(self, "GPX quá ít điểm",
+                                "File GPX phải có ít nhất 2 điểm waypoint.")
+            return
+        self._a_gpx_pending = wpts
+        fname = os.path.basename(path)
+        self._a_gpx_label.setText(f"{fname}  ({len(wpts)} điểm)")
+        self._a_gpx_label.setStyleSheet("color:#00e676;")
+        self._a_gpx_status.setText(f"Waypoint 1/{len(wpts)}")
+
+    def _on_ais_gpx_clear_file(self) -> None:
+        self._a_gpx_pending = None
+        # Đánh dấu vessel hiện tại sẽ bị xóa route khi Add/Update kế tiếp
+        cur_mmsi = getattr(self, '_a_last_loaded_mmsi', None)
+        if cur_mmsi is not None:
+            self._ais_vessel_routes.pop(cur_mmsi, None)
+        self._a_gpx_label.setText("Chưa chọn file")
+        self._a_gpx_label.setStyleSheet("color:#90a4ae; font-style:italic;")
+        self._a_gpx_status.setText("—")
 
     def _refresh_ais_list(self) -> None:
         self._ais_list.clear()
         for mmsi, v in self._ais_gen.vessels.items():
             name = v.get('shipname', '') or '—'
             cls = v.get('ais_class', 'A')
+            route_tag = ''
+            if mmsi in self._ais_vessel_routes:
+                idx = v.get('_route_idx', 0)
+                n = len(self._ais_vessel_routes[mmsi])
+                route_tag = f'  [GPX {idx + 1}/{n}]'
             self._ais_list.addItem(
-                f"{mmsi}  [{name}]  Cls={cls}  "
+                f"{mmsi}  [{name}]  Cls={cls}{route_tag}  "
                 f"Lat={v['lat']:10.6f}  Lon={v['lon']:11.6f}  "
                 f"SOG={v['sog']:5.1f} kn  COG={v['cog']:6.1f}°"
             )
@@ -1723,6 +1829,15 @@ class MainWindow(QMainWindow):
                     self._a_lon.setValue(v['lon'])
                     self._a_lat.blockSignals(False)
                     self._a_lon.blockSignals(False)
+                    # Cập nhật live waypoint status cho vessel đang chọn
+                    if mmsi in self._ais_vessel_routes and v.get('_route'):
+                        idx = v.get('_route_idx', 0)
+                        n = len(self._ais_vessel_routes[mmsi])
+                        done = v.get('_route_done', False)
+                        self._a_gpx_status.setText(
+                            f"Đã đến điểm cuối ({n}/{n})" if done
+                            else f"Waypoint {idx + 1}/{n}"
+                        )
 
     # Fusion test scenario ------------------------------------------------
 
