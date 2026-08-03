@@ -1,9 +1,10 @@
 """Maritime Signal Simulator — main entry point and UI."""
 
+import os
 import sys
 
 from PyQt6.QtCore import Qt, QDateTime, QTimer, pyqtSlot
-from PyQt6.QtGui import QFont, QIntValidator
+from PyQt6.QtGui import QFont, QIcon, QIntValidator
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -2016,6 +2017,16 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(_APP_QSS)
+
+    if getattr(sys, 'frozen', False):
+        base_dir = sys._MEIPASS
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    icon_path = os.path.join(base_dir, "icon.ico")
+    if os.path.exists(icon_path):
+        icon = QIcon(icon_path)
+        app.setWindowIcon(icon)
+
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
