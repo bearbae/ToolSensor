@@ -1,2 +1,8 @@
 PyQt6>=6.6.0
 pyserial>=3.5
+
+# Tab Camera không thêm gói Python nào, nhưng cần 2 binary NGOÀI:
+#   ffmpeg + ffprobe — BẮT BUỘC. Để trong PATH, hoặc đặt cạnh main.py / file .exe đã đóng gói.
+#   go2rtc           — tuỳ chọn, chỉ Replay mới dùng. Không có thì lùi về ffmpeg và chỉ phục vụ
+#                      được MỘT client xem cùng lúc. Tải ở github.com/AlexxIT/go2rtc/releases.
+# Kiểm tra nhanh:  python camera.py tools

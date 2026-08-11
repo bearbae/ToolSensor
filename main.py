@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from camera_ui import CameraTab
 from generators import AISGenerator, GPSGenerator, RadarTTMGenerator, _latlon_from_bearing_range
 from transmitters import (
     SerialTransmitter,
@@ -100,7 +101,9 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Maritime Signal Simulator")
-        self.setMinimumSize(1280, 780)
+        # Hạ từ 1280x780: cả hai tab đã chịu được cỡ này (đo bằng script kiểm bố cục — không ô
+        # nào đè lên ô nào), nên cho phép kéo nhỏ để chia đôi màn hình với hải đồ/terminal.
+        self.setMinimumSize(1024, 640)
 
         # Domain objects (shared with the background thread)
         self._gps_gen = GPSGenerator()
@@ -152,7 +155,19 @@ class MainWindow(QMainWindow):
         splitter.addWidget(left_scroll)
         splitter.addWidget(right)
         splitter.setSizes([400, 860])
-        root.addWidget(splitter)
+
+        # Camera là loại thiết bị khác hẳn (tiến trình ngoài, file, dung lượng) nên đứng riêng
+        # một tab ở cấp cao nhất thay vì chen vào Target Control cùng radar/AIS.
+        nmea_tab = QWidget()
+        nmea_layout = QHBoxLayout(nmea_tab)
+        nmea_layout.setContentsMargins(0, 0, 0, 0)
+        nmea_layout.addWidget(splitter)
+
+        self._camera_tab = CameraTab()
+        self._main_tabs = QTabWidget()
+        self._main_tabs.addTab(nmea_tab, "NMEA  (GPS / Radar / AIS)")
+        self._main_tabs.addTab(self._camera_tab, "Camera  (RTSP)")
+        root.addWidget(self._main_tabs)
 
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Disconnected")
@@ -1975,6 +1990,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._on_disconnect()
+        # Bắt buộc: tab Camera đang giữ ffmpeg/go2rtc. Không dọn thì chúng thành tiến trình mồ
+        # côi, vẫn ghi file và vẫn giữ cổng replay sau khi app đã đóng.
+        self._camera_tab.shutdown()
         event.accept()
 
 
