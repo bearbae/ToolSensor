@@ -9,6 +9,7 @@ DEFAULT_CONFIG = {
     "output_folder": os.path.expanduser("~/Documents/NMEA_Logs"),
     "daily_rotate": True,
     "auto_connect": False,
+    "max_folder_gb": None,
     "connections": []
 }
 

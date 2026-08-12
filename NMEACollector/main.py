@@ -55,8 +55,7 @@ _GPS_TAGS   = {'RMC','GGA','GNS','GLL','VTG','ZDA','GSA','GSV','GBS',
 _AIS_TAGS   = {'VDM','VDO'}
 _RADAR_TAGS = {'TTM','TTD','OSD','RSD','RCD','RCL'}
 
-MAX_CONNECTIONS = 5
-
+MAX_CONNECTIONS = 25
 
 def _tag_colour(tag: str) -> str:
     if tag in _AIS_TAGS:   return _COL_AIS
@@ -88,11 +87,12 @@ class ConnectionRow(QGroupBox):
     sentence_received = pyqtSignal(str, str, str)   # sentence, tag, label
     request_remove    = pyqtSignal(object)           # self
 
-    def __init__(self, row_id: int, get_folder, get_daily_rotate):
+    def __init__(self, row_id: int, get_folder, get_daily_rotate, get_max_folder_gb):
         super().__init__(f"Kết nối #{row_id}")
         self._id              = row_id
         self._get_folder      = get_folder        # callable → str
         self._get_daily_rot   = get_daily_rotate  # callable → bool
+        self._get_max_gb      = get_max_folder_gb # callable → float | None
         self._receiver: ReceiverThread | None = None
         self._logger:   SessionLogger  | None = None
         self._stats:    dict[str, int]        = {}
@@ -282,15 +282,18 @@ class ConnectionRow(QGroupBox):
 
             folder = self._get_folder()
             prefix = self._prefix.text().strip() or "session"
+            max_gb = self._get_max_gb()
             if self._last_path and os.path.exists(self._last_path):
                 # Kết nối lại → ghi tiếp vào file cũ
                 self._logger = SessionLogger(folder, prefix,
                                              existing_path=self._last_path,
-                                             daily_rotate=self._get_daily_rot())
+                                             daily_rotate=self._get_daily_rot(),
+                                             max_folder_gb=max_gb)
             else:
                 # Lần đầu kết nối → tạo file mới
                 self._logger = SessionLogger(folder, prefix,
-                                             daily_rotate=self._get_daily_rot())
+                                             daily_rotate=self._get_daily_rot(),
+                                             max_folder_gb=max_gb)
                 self._last_path = self._logger.path
             self._lbl_file.setText(os.path.basename(self._logger.path))
             self._lbl_status.setText("Đang kết nối…")
@@ -430,6 +433,15 @@ class MainWindow(QMainWindow):
         folder_row.addWidget(btn_f)
         f.addRow("Lưu vào:", folder_row)
 
+        limit_row = QHBoxLayout()
+        self._txt_max_gb = QLineEdit()
+        self._txt_max_gb.setPlaceholderText("Không giới hạn")
+        self._txt_max_gb.setFixedWidth(80)
+        limit_row.addWidget(self._txt_max_gb)
+        limit_row.addWidget(QLabel("GB"))
+        limit_row.addStretch()
+        f.addRow("Giới hạn thư mục log:", limit_row)
+
         self._chk_rotate   = QCheckBox("Tự tạo file khi sang ngày mới")
         self._chk_auto     = QCheckBox("Tự động kết nối khi khởi động")
         self._chk_startup  = QCheckBox("Tự khởi động cùng hệ thống")
@@ -454,7 +466,7 @@ class MainWindow(QMainWindow):
         return grp
 
     def _build_connections_panel(self) -> QGroupBox:
-        grp = QGroupBox("Các kết nối (tối đa 5)")
+        grp = QGroupBox("Các kết nối (tối đa 25)")
         lay = QVBoxLayout(grp)
 
         # Toolbar
@@ -547,6 +559,8 @@ class MainWindow(QMainWindow):
     # ── Config ────────────────────────────────────────────────────────────
 
     def _load_config_to_ui(self):
+        max_gb = self._cfg.get("max_folder_gb")
+        self._txt_max_gb.setText(str(max_gb) if max_gb else "")
         self._txt_folder.setText(self._cfg.get("output_folder",
             os.path.expanduser("~/Documents/NMEA_Logs")))
         self._chk_rotate.setChecked(self._cfg.get("daily_rotate", True))
@@ -559,6 +573,10 @@ class MainWindow(QMainWindow):
         self._cfg["output_folder"]  = self._txt_folder.text()
         self._cfg["daily_rotate"]   = self._chk_rotate.isChecked()
         self._cfg["auto_connect"]   = self._chk_auto.isChecked()
+        try:
+            self._cfg["max_folder_gb"] = float(self._txt_max_gb.text()) or None
+        except ValueError:
+            self._cfg["max_folder_gb"] = None
         self._cfg["connections"]    = [r.get_config() for r in self._rows]
         cfg_io.save(self._cfg)
         self.statusBar().showMessage("Đã lưu cấu hình", 3000)
@@ -573,8 +591,9 @@ class MainWindow(QMainWindow):
         row_id = len(self._rows) + 1
         row = ConnectionRow(
             row_id,
-            get_folder      = lambda: self._txt_folder.text(),
-            get_daily_rotate= lambda: self._chk_rotate.isChecked(),
+            get_folder       = lambda: self._txt_folder.text(),
+            get_daily_rotate = lambda: self._chk_rotate.isChecked(),
+            get_max_folder_gb= lambda: float(self._txt_max_gb.text()) if self._txt_max_gb.text() else None,
         )
         row.sentence_received.connect(self._on_sentence)
         row.request_remove.connect(self._remove_row)
