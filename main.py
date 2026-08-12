@@ -35,6 +35,25 @@ from PyQt6.QtWidgets import (
 )
 
 from generators import AISGenerator, GPSGenerator, RadarTTMGenerator, _latlon_from_bearing_range
+
+
+def _parse_speed_schedule(text: str) -> list:
+    """Parse '0:20, 5:8, 12:20' → [(0, 20.0), ...] sorted ascending by waypoint index."""
+    result = []
+    for part in text.split(','):
+        part = part.strip()
+        if ':' not in part:
+            continue
+        wp_str, spd_str = part.split(':', 1)
+        try:
+            wp = int(wp_str.strip())
+            spd = float(spd_str.strip())
+            if wp >= 0 and spd >= 0:
+                result.append((wp, spd))
+        except ValueError:
+            continue
+    result.sort(key=lambda x: x[0])
+    return result
 from gpx_parser import parse_gpx
 from transmitters import (
     SerialTransmitter,
@@ -114,8 +133,9 @@ class MainWindow(QMainWindow):
         self._thread: TransmitterThread | None = None
         self._fusion_entries: list = []
 
-        self._a_gpx_pending: list | None = None        # waypoints đang chờ gán cho vessel
-        self._ais_vessel_routes: dict[int, list] = {}  # mmsi → waypoints
+        self._a_gpx_pending: list | None = None           # waypoints đang chờ gán cho vessel
+        self._ais_vessel_routes: dict[int, list] = {}     # mmsi → waypoints
+        self._ais_vessel_schedules: dict[int, list] = {}  # mmsi → [(wp_idx, sog_kn), ...]
 
         self._gps_display_timer = QTimer(self)
         self._gps_display_timer.setInterval(500)
@@ -783,7 +803,8 @@ class MainWindow(QMainWindow):
         # GPX Route group
         gpx_grp = QGroupBox("GPX Route")
         gpx_lay = QVBoxLayout(gpx_grp)
-        gpx_lay.setSpacing(4)
+        gpx_lay.setSpacing(6)
+        gpx_lay.setContentsMargins(8, 6, 8, 8)
 
         gpx_file_row = QHBoxLayout()
         self._a_gpx_label = QLabel("Chưa chọn file")
@@ -799,12 +820,36 @@ class MainWindow(QMainWindow):
 
         gpx_opt_row = QHBoxLayout()
         self._a_gpx_loop = QCheckBox("Lặp lại route")
+        self._a_gpx_speed_var = QCheckBox("Biến thiên tốc độ")
         self._a_gpx_status = QLabel("—")
         self._a_gpx_status.setStyleSheet("color:#90a4ae;")
         gpx_opt_row.addWidget(self._a_gpx_loop)
+        gpx_opt_row.addSpacing(12)
+        gpx_opt_row.addWidget(self._a_gpx_speed_var)
         gpx_opt_row.addStretch()
         gpx_opt_row.addWidget(self._a_gpx_status)
         gpx_lay.addLayout(gpx_opt_row)
+
+        # Speed schedule container — ẩn mặc định, chỉ hiện khi bật checkbox
+        self._a_gpx_sched_container = QWidget()
+        sched_lay = QVBoxLayout(self._a_gpx_sched_container)
+        sched_lay.setContentsMargins(0, 2, 0, 0)
+        sched_lay.setSpacing(4)
+
+        sched_input_row = QHBoxLayout()
+        sched_input_row.addWidget(QLabel("Lịch tốc độ (WP:kn):"))
+        self._a_gpx_schedule_edit = QLineEdit()
+        self._a_gpx_schedule_edit.setPlaceholderText("VD: 0:20, 5:8, 12:20")
+        sched_input_row.addWidget(self._a_gpx_schedule_edit, stretch=1)
+        sched_lay.addLayout(sched_input_row)
+
+        self._a_gpx_sched_cur = QLabel("Tốc độ hiện tại: —")
+        self._a_gpx_sched_cur.setStyleSheet("color:#90a4ae; font-style:italic;")
+        sched_lay.addWidget(self._a_gpx_sched_cur)
+
+        self._a_gpx_sched_container.setVisible(False)
+        gpx_lay.addWidget(self._a_gpx_sched_container)
+
         at_layout.addWidget(gpx_grp)
 
         # Auto generate row
@@ -1195,6 +1240,7 @@ class MainWindow(QMainWindow):
         self._ais_list.itemClicked.connect(self._on_ais_item_clicked)
         self._btn_a_gpx_load.clicked.connect(self._on_ais_gpx_load)
         self._btn_a_gpx_clear_file.clicked.connect(self._on_ais_gpx_clear_file)
+        self._a_gpx_speed_var.toggled.connect(self._a_gpx_sched_container.setVisible)
 
         # Fusion test
         self._btn_fm_add.clicked.connect(self._on_fusion_manual_add)
@@ -1603,6 +1649,8 @@ class MainWindow(QMainWindow):
 
     def _on_ais_clear(self) -> None:
         self._ais_gen.vessels.clear()
+        self._ais_vessel_routes.clear()
+        self._ais_vessel_schedules.clear()
         self._refresh_ais_list()
 
     def _refresh_radar_list(self) -> None:
@@ -1672,6 +1720,22 @@ class MainWindow(QMainWindow):
                 v_live['_route_loop'] = self._a_gpx_loop.isChecked()
         else:
             self._ais_gen.clear_vessel_route(new_mmsi)
+
+        # Speed schedule
+        v_live = self._ais_gen.vessels.get(new_mmsi)
+        if v_live is not None:
+            if self._a_gpx_speed_var.isChecked():
+                schedule = _parse_speed_schedule(self._a_gpx_schedule_edit.text())
+                if schedule:
+                    v_live['_speed_schedule'] = schedule
+                    self._ais_vessel_schedules[new_mmsi] = schedule
+                else:
+                    v_live.pop('_speed_schedule', None)
+                    self._ais_vessel_schedules.pop(new_mmsi, None)
+            else:
+                v_live.pop('_speed_schedule', None)
+                self._ais_vessel_schedules.pop(new_mmsi, None)
+
         self._refresh_ais_list()
         self._refresh_fusion_list()
 
@@ -1681,6 +1745,7 @@ class MainWindow(QMainWindow):
             mmsi = int(items[0].text().split()[0])
             self._ais_gen.remove_vessel(mmsi)
             self._ais_vessel_routes.pop(mmsi, None)
+            self._ais_vessel_schedules.pop(mmsi, None)
             self._refresh_ais_list()
             self._refresh_fusion_list()
 
@@ -1730,6 +1795,22 @@ class MainWindow(QMainWindow):
             self._a_gpx_label.setStyleSheet("color:#90a4ae; font-style:italic;")
             self._a_gpx_status.setText("—")
 
+        # Khôi phục speed schedule state
+        schedule = self._ais_vessel_schedules.get(mmsi)
+        if schedule:
+            self._a_gpx_speed_var.setChecked(True)
+            self._a_gpx_schedule_edit.setText(
+                ', '.join(f"{wp}:{sog:g}" for wp, sog in schedule)
+            )
+            eff_sog = self._ais_gen.get_vessel_effective_sog(mmsi)
+            self._a_gpx_sched_cur.setText(
+                f"Tốc độ hiện tại: {eff_sog:.1f} kn" if eff_sog is not None else "Tốc độ hiện tại: —"
+            )
+        else:
+            self._a_gpx_speed_var.setChecked(False)
+            self._a_gpx_schedule_edit.setText('')
+            self._a_gpx_sched_cur.setText("Tốc độ hiện tại: —")
+
     def _on_ais_gpx_load(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Chọn file GPX", "", "GPX Files (*.gpx);;All Files (*)"
@@ -1753,13 +1834,16 @@ class MainWindow(QMainWindow):
 
     def _on_ais_gpx_clear_file(self) -> None:
         self._a_gpx_pending = None
-        # Đánh dấu vessel hiện tại sẽ bị xóa route khi Add/Update kế tiếp
         cur_mmsi = getattr(self, '_a_last_loaded_mmsi', None)
         if cur_mmsi is not None:
             self._ais_vessel_routes.pop(cur_mmsi, None)
+            self._ais_vessel_schedules.pop(cur_mmsi, None)
         self._a_gpx_label.setText("Chưa chọn file")
         self._a_gpx_label.setStyleSheet("color:#90a4ae; font-style:italic;")
         self._a_gpx_status.setText("—")
+        self._a_gpx_speed_var.setChecked(False)
+        self._a_gpx_schedule_edit.setText('')
+        self._a_gpx_sched_cur.setText("Tốc độ hiện tại: —")
 
     def _refresh_ais_list(self) -> None:
         self._ais_list.clear()
@@ -1771,10 +1855,13 @@ class MainWindow(QMainWindow):
                 idx = v.get('_route_idx', 0)
                 n = len(self._ais_vessel_routes[mmsi])
                 route_tag = f'  [GPX {idx + 1}/{n}]'
+            # Hiện effective SOG (từ schedule nếu có) thay vì base SOG
+            eff_sog = self._ais_gen.get_vessel_effective_sog(mmsi)
+            sog_display = eff_sog if eff_sog is not None else v['sog']
             self._ais_list.addItem(
                 f"{mmsi}  [{name}]  Cls={cls}{route_tag}  "
                 f"Lat={v['lat']:10.6f}  Lon={v['lon']:11.6f}  "
-                f"SOG={v['sog']:5.1f} kn  COG={v['cog']:6.1f}°"
+                f"SOG={sog_display:5.1f} kn  COG={v['cog']:6.1f}°"
             )
 
     # GPS live display ----------------------------------------------------
@@ -1829,7 +1916,7 @@ class MainWindow(QMainWindow):
                     self._a_lon.setValue(v['lon'])
                     self._a_lat.blockSignals(False)
                     self._a_lon.blockSignals(False)
-                    # Cập nhật live waypoint status cho vessel đang chọn
+                    # Cập nhật live waypoint status và speed schedule label
                     if mmsi in self._ais_vessel_routes and v.get('_route'):
                         idx = v.get('_route_idx', 0)
                         n = len(self._ais_vessel_routes[mmsi])
@@ -1838,6 +1925,12 @@ class MainWindow(QMainWindow):
                             f"Đã đến điểm cuối ({n}/{n})" if done
                             else f"Waypoint {idx + 1}/{n}"
                         )
+                        if self._a_gpx_speed_var.isChecked():
+                            eff = self._ais_gen.get_vessel_effective_sog(mmsi)
+                            if eff is not None:
+                                self._a_gpx_sched_cur.setText(
+                                    f"Tốc độ hiện tại: {eff:.1f} kn  ←  WP {idx}"
+                                )
 
     # Fusion test scenario ------------------------------------------------
 

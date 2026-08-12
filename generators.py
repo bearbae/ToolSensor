@@ -67,6 +67,28 @@ def _bearing_range(own_lat: float, own_lon: float,
     return bearing, range_nm
 
 
+def _get_scheduled_sog(vessel: dict, idx: int | None = None) -> float:
+    """Return effective SOG: from speed schedule at current waypoint, else vessel['sog'].
+
+    If the schedule's first entry has wp_idx > current idx (vessel hasn't reached the
+    first scheduled waypoint yet), the first entry's speed is still used as the base
+    so the vessel can actually move and reach that waypoint.
+    """
+    schedule = vessel.get('_speed_schedule')
+    if not schedule:
+        return vessel['sog']
+    if idx is None:
+        idx = vessel.get('_route_idx', 0)
+    # Default: use the first entry's speed so vessel is never stuck at 0 before schedule kicks in
+    sog = schedule[0][1]
+    for wp_idx, wp_sog in schedule:      # schedule is sorted ascending by wp_idx
+        if wp_idx <= idx:
+            sog = wp_sog
+        else:
+            break
+    return sog
+
+
 def _advance_along_route(vessel: dict, dt_hours: float) -> None:
     """Advance vessel position along its pre-loaded GPX route."""
     route = vessel['_route']
@@ -76,10 +98,15 @@ def _advance_along_route(vessel: dict, dt_hours: float) -> None:
 
     idx = vessel.get('_route_idx', 0)
     loop = vessel.get('_route_loop', False)
-    remaining_nm = vessel['sog'] * dt_hours
+    remaining_h = dt_hours              # remaining simulation time this tick (hours)
     lat, lon = vessel['lat'], vessel['lon']
 
-    while remaining_nm > 1e-6:
+    _MAX_ITERS = n * 3 + 50            # safety cap: at most 3 full loops + buffer
+    iters = 0
+    while remaining_h > 1e-9 and iters < _MAX_ITERS:
+        iters += 1
+        sog = max(_get_scheduled_sog(vessel, idx), 0.001)
+
         next_idx = (idx + 1) % n if loop else idx + 1
         if not loop and next_idx >= n:
             vessel['_route_done'] = True
@@ -90,22 +117,28 @@ def _advance_along_route(vessel: dict, dt_hours: float) -> None:
         next_lat, next_lon = route[next_idx]
         brg, dist = _bearing_range(lat, lon, next_lat, next_lon)
 
-        if dist < 1e-4:          # essentially at waypoint, skip ahead
+        if dist < 1e-4:          # waypoint trùng/quá gần → skip, tiêu thụ 0 thời gian
             idx = next_idx
+            lat, lon = next_lat, next_lon
             continue
 
-        if remaining_nm >= dist:
-            remaining_nm -= dist
+        time_to_next = dist / sog    # hours to reach next waypoint at current speed
+
+        if remaining_h >= time_to_next:
+            remaining_h -= time_to_next
             lat, lon = next_lat, next_lon
             idx = next_idx
         else:
-            spd = max(vessel['sog'], 0.001)
-            lat, lon = _move(lat, lon, brg, spd, remaining_nm / spd)
-            remaining_nm = 0
+            lat, lon = _move(lat, lon, brg, sog, remaining_h)
+            remaining_h = 0
 
     vessel['lat'] = lat
     vessel['lon'] = lon
     vessel['_route_idx'] = idx
+
+    # Đồng bộ vessel['sog'] với tốc độ thực tế theo schedule để bản tin AIS đúng
+    if vessel.get('_speed_schedule'):
+        vessel['sog'] = _get_scheduled_sog(vessel)
 
     # Keep COG pointed at next waypoint
     next_idx = (idx + 1) % n if loop else min(idx + 1, n - 1)
@@ -595,8 +628,9 @@ class AISGenerator:
             'imo': imo,
             'ais_class': ais_class,
         }
-        # Preserve route state and static-message timing from existing vessel
-        for key in ('_route', '_route_idx', '_route_loop', '_route_done', '_last_static_t'):
+        # Preserve route state, speed schedule, and static-message timing
+        for key in ('_route', '_route_idx', '_route_loop', '_route_done',
+                    '_speed_schedule', '_last_static_t'):
             if key in existing:
                 new_vessel[key] = existing[key]
         self.vessels[mmsi] = new_vessel
@@ -624,8 +658,13 @@ class AISGenerator:
         v = self.vessels.get(mmsi)
         if v is None:
             return
-        for key in ('_route', '_route_idx', '_route_loop', '_route_done'):
+        for key in ('_route', '_route_idx', '_route_loop', '_route_done', '_speed_schedule'):
             v.pop(key, None)
+
+    def get_vessel_effective_sog(self, mmsi: int) -> float | None:
+        """Return current effective SOG for vessel (schedule-aware). None if not found."""
+        v = self.vessels.get(mmsi)
+        return _get_scheduled_sog(v) if v else None
 
     def _build_type5_bits(self, mmsi: int, vessel: dict) -> list:
         """Build 424-bit AIS Type 5 (static & voyage data) payload."""
@@ -681,7 +720,7 @@ class AISGenerator:
         add_uint(mmsi, 30)                                      # MMSI
         add_uint(vessel['nav_status'], 4)                       # Nav status
         add_int(-128, 8)                                        # ROT (n/a)
-        add_uint(int(vessel['sog'] * 10), 10)                   # SOG ×10
+        add_uint(min(int(vessel['sog'] * 10), 1022), 10)        # SOG ×10, AIS max 102.2 kn
         add_uint(0, 1)                                          # Pos accuracy
         add_int(round(vessel['lon'] * 600000), 28)              # Lon (1/10000 min)
         add_int(round(vessel['lat'] * 600000), 27)              # Lat (1/10000 min)
@@ -715,7 +754,7 @@ class AISGenerator:
         add_uint(0, 2)                                                   # Repeat
         add_uint(mmsi, 30)                                               # MMSI
         add_uint(0, 8)                                                   # Reserved
-        add_uint(int(vessel['sog'] * 10), 10)                            # SOG ×10
+        add_uint(min(int(vessel['sog'] * 10), 1022), 10)                 # SOG ×10, AIS max 102.2 kn
         add_uint(0, 1)                                                   # Pos accuracy
         add_int(round(vessel['lon'] * 600000), 28)                       # Lon (1/10000 min)
         add_int(round(vessel['lat'] * 600000), 27)                       # Lat (1/10000 min)
