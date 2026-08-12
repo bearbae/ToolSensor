@@ -66,6 +66,9 @@ class SessionLogger:
         # Xoay file khi sang ngày mới
         if self._daily_rotate and now.date() != self._started.date():
             self._rotate()
+        # Tạo file mới nếu file bị xóa từ bên ngoài
+        elif not os.path.exists(self._path):
+            self._rotate()
         ts = now.isoformat(timespec="milliseconds")
         self._file.write(f"{ts}: [{type_tag}] {sentence}\n")
         self._file.flush()

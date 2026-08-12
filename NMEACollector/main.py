@@ -432,12 +432,20 @@ class MainWindow(QMainWindow):
 
         self._chk_rotate   = QCheckBox("Tự tạo file khi sang ngày mới")
         self._chk_auto     = QCheckBox("Tự động kết nối khi khởi động")
-        self._chk_startup  = QCheckBox("Tự khởi động cùng Windows")
+        self._chk_startup  = QCheckBox("Tự khởi động cùng hệ thống")
         self._chk_startup.setChecked(startup_mgr.is_enabled())
-        self._chk_startup.setToolTip(
-            "Đăng ký vào Windows Registry (HKCU) để tool tự mở khi máy tính khởi động.\n"
-            "Không cần quyền Administrator."
-        )
+        import sys as _sys
+        if _sys.platform.startswith("linux"):
+            _startup_tip = (
+                "Tạo file ~/.config/autostart/nmea-collector.desktop\n"
+                "để tool tự mở khi đăng nhập (hỗ trợ GNOME, KDE, XFCE…)."
+            )
+        else:
+            _startup_tip = (
+                "Đăng ký vào Windows Registry (HKCU) để tool tự mở khi máy tính khởi động.\n"
+                "Không cần quyền Administrator."
+            )
+        self._chk_startup.setToolTip(_startup_tip)
         self._chk_startup.toggled.connect(self._on_startup_toggled)
         f.addRow("", self._chk_rotate)
         f.addRow("", self._chk_auto)
