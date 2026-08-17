@@ -796,9 +796,30 @@ class MainWindow(QMainWindow):
             event.accept()
 
 
+# ── Crash logger ─────────────────────────────────────────────────────────────
+
+def _setup_crash_log():
+    import traceback
+    log_path = os.path.expanduser("~/nmea_collector_crash.log")
+
+    def _handle_exception(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"CRASH: {datetime.now().isoformat()}\n")
+            f.write(''.join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _handle_exception
+    return log_path
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    _setup_crash_log()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     win = MainWindow()
