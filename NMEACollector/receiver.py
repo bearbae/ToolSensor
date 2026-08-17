@@ -57,6 +57,9 @@ class ReceiverThread(QThread):
         while '\n' in buf:
             line, buf = buf.split('\n', 1)
             self._emit(line)
+        # Xóa buffer nếu quá lớn mà không có newline (tránh memory leak)
+        if len(buf) > 8192:
+            buf = ''
         return buf
 
     # ── serial (có tự động kết nối lại) ────────────────────────────────────
@@ -80,6 +83,8 @@ class ReceiverThread(QThread):
                                 while b'\n' in raw_buf:
                                     line_b, raw_buf = raw_buf.split(b'\n', 1)
                                     self._emit(line_b.decode('ascii', errors='replace'))
+                                if len(raw_buf) > 8192:
+                                    raw_buf = b''
                         except serial.SerialException as exc:
                             self.status_changed.emit(
                                 f"Lỗi Serial: {exc}, thử lại sau {self._RETRY_DELAY}s…"
@@ -136,9 +141,12 @@ class ReceiverThread(QThread):
 
     # ── TCP server ──────────────────────────────────────────────────────────
 
+    _MAX_SERVER_CLIENTS = 20
+
     def _run_tcp_server(self) -> None:
         host = self._kwargs.get('host', '0.0.0.0')
         port = self._kwargs['port']
+        client_threads: list[threading.Thread] = []
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             srv.bind((host, port))
@@ -148,11 +156,17 @@ class ReceiverThread(QThread):
             while self._running:
                 try:
                     conn, addr = srv.accept()
+                    # Dọn dẹp thread đã xong trước khi tạo mới
+                    client_threads = [t for t in client_threads if t.is_alive()]
+                    if len(client_threads) >= self._MAX_SERVER_CLIENTS:
+                        conn.close()
+                        continue
                     self.status_changed.emit(f"Client connected: {addr[0]}:{addr[1]}")
                     t = threading.Thread(
                         target=self._handle_client, args=(conn,), daemon=True
                     )
                     t.start()
+                    client_threads.append(t)
                 except socket.timeout:
                     continue
 

@@ -1,7 +1,10 @@
 """Ghi bản tin NMEA vào file .bin có đánh dấu thời gian, hỗ trợ xoay file theo ngày."""
 
 import os
+import shutil
 from datetime import datetime
+
+_MIN_FREE_BYTES = 5 * 1024 ** 3   # luôn giữ tối thiểu 5GB trống trên ổ đĩa
 
 
 class SessionLogger:
@@ -45,28 +48,66 @@ class SessionLogger:
         os.makedirs(self._output_dir, exist_ok=True)
         self._file = open(self._path, "w", encoding="utf-8")
 
-    def _enforce_size_limit(self) -> None:
-        """Xóa file log cũ nhất cho đến khi thư mục dưới ngưỡng giới hạn."""
-        if not self._max_bytes:
-            return
+    def _get_log_files(self) -> list[str]:
+        """Danh sách file trong thư mục log, sắp xếp cũ nhất trước."""
         try:
             entries = [
                 os.path.join(self._output_dir, f)
                 for f in os.listdir(self._output_dir)
                 if os.path.isfile(os.path.join(self._output_dir, f))
             ]
-            # Sắp xếp theo thời gian chỉnh sửa, cũ nhất trước
             entries.sort(key=lambda p: os.path.getmtime(p))
-            total = sum(os.path.getsize(p) for p in entries)
-            for path in entries:
-                if total <= self._max_bytes:
-                    break
-                # Không xóa file đang ghi
-                if os.path.abspath(path) == os.path.abspath(self._path):
-                    continue
-                size = os.path.getsize(path)
+            return entries
+        except Exception:
+            return []
+
+    def _delete_oldest(self, files: list[str]) -> None:
+        """Xóa file cũ nhất (trừ file đang ghi)."""
+        for path in files:
+            if os.path.abspath(path) == os.path.abspath(self._path):
+                continue
+            try:
                 os.remove(path)
-                total -= size
+            except Exception:
+                pass
+            break
+
+    def _enforce_size_limit(self) -> None:
+        """Xóa file log cũ nếu vượt giới hạn thư mục hoặc ổ đĩa gần đầy."""
+        try:
+            files = self._get_log_files()
+            if not files:
+                return
+
+            # Điều kiện 1: thư mục vượt giới hạn người dùng đặt
+            if self._max_bytes:
+                total = sum(os.path.getsize(p) for p in files)
+                while total > self._max_bytes and len(files) > 1:
+                    oldest = next(
+                        (p for p in files
+                         if os.path.abspath(p) != os.path.abspath(self._path)),
+                        None
+                    )
+                    if not oldest:
+                        break
+                    total -= os.path.getsize(oldest)
+                    os.remove(oldest)
+                    files.remove(oldest)
+
+            # Điều kiện 2: ổ đĩa còn dưới 5GB (luôn kiểm tra dù có hay không có giới hạn)
+            free = shutil.disk_usage(self._output_dir).free
+            while free < _MIN_FREE_BYTES and len(files) > 1:
+                oldest = next(
+                    (p for p in files
+                     if os.path.abspath(p) != os.path.abspath(self._path)),
+                    None
+                )
+                if not oldest:
+                    break
+                os.remove(oldest)
+                files.remove(oldest)
+                free = shutil.disk_usage(self._output_dir).free
+
         except Exception:
             pass
 

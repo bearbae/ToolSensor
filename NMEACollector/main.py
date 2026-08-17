@@ -307,6 +307,7 @@ class ConnectionRow(QGroupBox):
     def disconnect(self):
         if self._receiver:
             self._receiver.stop()
+            self._receiver.wait(3000)  # chờ tối đa 3s để thread kết thúc sạch
             self._receiver = None
         if self._logger:
             self._logger.close()
@@ -323,11 +324,15 @@ class ConnectionRow(QGroupBox):
     @pyqtSlot(str, str)
     def _on_sentence(self, sentence: str, tag: str):
         if self._logger and self._logger.is_open:
-            self._logger.write(sentence, tag)
-            # Cập nhật nếu file đã xoay sang ngày mới
-            if self._logger.path != self._last_path:
-                self._last_path = self._logger.path
-                self._lbl_file.setText(os.path.basename(self._logger.path))
+            try:
+                self._logger.write(sentence, tag)
+                # Cập nhật nếu file đã xoay sang ngày mới
+                if self._logger.path != self._last_path:
+                    self._last_path = self._logger.path
+                    self._lbl_file.setText(os.path.basename(self._logger.path))
+            except OSError as exc:
+                self._lbl_status.setText(f"Lỗi ghi file: {exc}")
+                self._dot.setStyleSheet("color:#ef5350; font-size:13px;")
 
         self._stats[tag] = self._stats.get(tag, 0) + 1
         self._total += 1
@@ -378,6 +383,7 @@ class MainWindow(QMainWindow):
         self._stat_labels: dict[str, QLabel] = {}   # cache label widget để không tạo lại
         self._total_rx = 0
         self._log_line_count = 0
+        self._console_buf: list[str] = []  # buffer câu NMEA chờ flush ra console
 
         self._build_ui()
         self._build_tray()
@@ -541,6 +547,7 @@ class MainWindow(QMainWindow):
 
         self._log = QTextEdit()
         self._log.setReadOnly(True)
+        self._log.setUndoRedoEnabled(False)
         self._log.setFont(QFont("Consolas", 9))
         self._log.setStyleSheet(f"background:{_LOG_BG}; color:#fff; border:none;")
         lay.addWidget(self._log)
@@ -649,8 +656,8 @@ class MainWindow(QMainWindow):
 
     # ── Sentence received ─────────────────────────────────────────────────
 
-    _MAX_LOG_LINES = 3000    # giữ tối đa N dòng trong console
-    _TRIM_TO_LINES = 2000    # cắt xuống còn N dòng khi vượt ngưỡng
+    _MAX_LOG_LINES = 200     # giữ tối đa N dòng trong console
+    _TRIM_TO_LINES = 100     # cắt xuống còn N dòng khi vượt ngưỡng
 
     @pyqtSlot(str, str, str)
     def _on_sentence(self, sentence: str, tag: str, label: str):
@@ -659,15 +666,25 @@ class MainWindow(QMainWindow):
 
         ts     = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         colour = _tag_colour(tag)
-        self._log.append(
+        self._console_buf.append(
             f'<span style="color:#546e7a;">{ts}</span>'
             f'&nbsp;<span style="color:#607d8b;">[{label}]</span>'
             f'&nbsp;<span style="color:{_COL_INFO};">[{tag}]</span>'
             f'&nbsp;<span style="color:{colour};">{sentence}</span>'
         )
-        self._log_line_count += 1
+        # Giới hạn buffer để tránh tích lũy nếu timer bị trễ
+        if len(self._console_buf) > 500:
+            self._console_buf = self._console_buf[-200:]
 
-        # Tự cắt log khi quá nhiều dòng để tránh rò bộ nhớ
+    def _flush_console(self):
+        """Gọi từ timer — flush buffer ra console, giới hạn số dòng."""
+        if not self._console_buf:
+            return
+        for line in self._console_buf:
+            self._log.append(line)
+            self._log_line_count += 1
+        self._console_buf.clear()
+
         if self._log_line_count >= self._MAX_LOG_LINES:
             doc    = self._log.document()
             cursor = QTextCursor(doc)
@@ -691,6 +708,7 @@ class MainWindow(QMainWindow):
             row.tick()
         self._lbl_total.setText(f"Tổng nhận: {self._total_rx}")
         self._rebuild_stats()
+        self._flush_console()
 
     def _rebuild_stats(self):
         # Chỉ tạo label mới cho tag chưa có, cập nhật text thay vì tạo lại từ đầu
