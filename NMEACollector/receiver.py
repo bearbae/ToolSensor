@@ -106,6 +106,19 @@ class ReceiverThread(QThread):
 
     _RETRY_DELAY = 5   # giây chờ giữa các lần thử lại
 
+    _NO_DATA_TIMEOUT = 30   # giây không nhận data → coi như mất kết nối
+
+    def _apply_keepalive(self, sock: socket.socket) -> None:
+        """Bật TCP keepalive để OS phát hiện kết nối chết."""
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, 'TCP_KEEPIDLE'):    # Linux
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except Exception:
+            pass
+
     def _run_tcp_client(self) -> None:
         host = self._kwargs['host']
         port = self._kwargs['port']
@@ -114,17 +127,23 @@ class ReceiverThread(QThread):
             try:
                 self.status_changed.emit(f"Đang kết nối {host}:{port}…")
                 with socket.create_connection((host, port), timeout=5) as sock:
+                    self._apply_keepalive(sock)
                     sock.settimeout(1.0)
                     self.status_changed.emit(f"Đã kết nối {host}:{port}")
                     buf = ''
+                    last_data = time.time()
                     while self._running:
                         try:
                             data = sock.recv(4096).decode('ascii', errors='replace')
                             if not data:
                                 self.status_changed.emit("Bên phát ngắt kết nối, đang thử lại…")
                                 break
+                            last_data = time.time()
                             buf = self._split_lines(buf, data)
                         except socket.timeout:
+                            if time.time() - last_data > self._NO_DATA_TIMEOUT:
+                                self.status_changed.emit("Không nhận được data, đang thử kết nối lại…")
+                                break
                             continue
             except OSError as exc:
                 if not self._running:
