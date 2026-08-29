@@ -34,7 +34,16 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from generators import AISGenerator, GPSGenerator, RadarTTMGenerator, _latlon_from_bearing_range
+from generators import (
+    AISGenerator,
+    GPSGenerator,
+    RadarTTMGenerator,
+    _bearing_range,
+    _latlon_from_bearing_range,
+    _move,
+)
+import ssh_settings
+from ssh_tunnel import SSHTunnel, fetch_pod_ip
 
 
 def _parse_speed_schedule(text: str) -> list:
@@ -54,12 +63,38 @@ def _parse_speed_schedule(text: str) -> list:
             continue
     result.sort(key=lambda x: x[0])
     return result
+
+
+def _sample_zone_point(zone: tuple) -> tuple:
+    """Sinh 1 điểm (lat, lon) ngẫu nhiên trong 1 vùng nước.
+
+    zone = (name, kind, lat1, lon1, lat2, lon2, size, zone_type, weight)
+    - kind='circle': điểm ngẫu nhiên trong bán kính `size` NM quanh (lat1, lon1)
+      — dùng cho biển/vịnh mở, đủ rộng nên full-circle vẫn an toàn.
+    - kind='corridor': điểm dọc theo đoạn thẳng xấp xỉ luồng/sông từ
+      (lat1, lon1) đến (lat2, lon2), lệch vuông góc tối đa `size` NM — tránh
+      full-circle rơi lên bờ như cách sinh cũ, vì sông/kênh thường hẹp.
+    """
+    import random
+    _, kind, lat1, lon1, lat2, lon2, size, _z_type, _w = zone
+    if kind == 'circle':
+        bearing = random.uniform(0, 360)
+        range_nm = random.uniform(0, size)
+        return _latlon_from_bearing_range(lat1, lon1, bearing, range_nm)
+
+    axis_brg, length_nm = _bearing_range(lat1, lon1, lat2, lon2)
+    dist_along = random.uniform(0, length_nm)
+    lat_c, lon_c = _move(lat1, lon1, axis_brg, dist_along, 1.0)
+    perp_offset = random.uniform(-size, size)
+    perp_brg = (axis_brg + 90.0) % 360
+    return _move(lat_c, lon_c, perp_brg, perp_offset, 1.0)
 from gpx_parser import parse_gpx
 from transmitters import (
     SerialTransmitter,
     TCPServerTransmitter,
     TCPTransmitter,
     TransmitterThread,
+    UDPTransmitter,
     list_serial_ports,
 )
 
@@ -124,12 +159,22 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Maritime Signal Simulator")
         self.setMinimumSize(1280, 780)
 
+        # Vị trí xuất phát ngẫu nhiên cho tàu mình (cảng/sông VN, đôi khi
+        # ngoài khơi) — tính trước khi build UI để đồng bộ cả generator lẫn
+        # giá trị mặc định trên các spinbox.
+        self._start_lat, self._start_lon = self._random_own_ship_start()
+
         # Domain objects (shared with the background thread)
         self._gps_gen = GPSGenerator()
+        self._gps_gen.lat = self._start_lat
+        self._gps_gen.lon = self._start_lon
         self._radar_gen = RadarTTMGenerator()
+        self._radar_gen.own_lat = self._start_lat
+        self._radar_gen.own_lon = self._start_lon
         self._ais_gen = AISGenerator()
 
         self._transmitter = None
+        self._ssh_tunnel: SSHTunnel | None = None
         self._thread: TransmitterThread | None = None
         self._fusion_entries: list = []
 
@@ -194,14 +239,17 @@ class MainWindow(QMainWindow):
         self._rb_tcp = QRadioButton("TCP Client")
         self._rb_tcp_server = QRadioButton("TCP Server")
         self._rb_serial = QRadioButton("Serial Port")
+        self._rb_ssh = QRadioButton("SSH Tunnel")
         self._rb_tcp.setChecked(True)
         self._mode_grp = QButtonGroup(self)
         self._mode_grp.addButton(self._rb_tcp)
         self._mode_grp.addButton(self._rb_tcp_server)
         self._mode_grp.addButton(self._rb_serial)
+        self._mode_grp.addButton(self._rb_ssh)
         mode_row.addWidget(self._rb_tcp)
         mode_row.addWidget(self._rb_tcp_server)
         mode_row.addWidget(self._rb_serial)
+        mode_row.addWidget(self._rb_ssh)
         layout.addLayout(mode_row)
 
         # TCP Client sub-panel
@@ -260,6 +308,69 @@ class MainWindow(QMainWindow):
 
         self._serial_widget.setVisible(False)
         layout.addWidget(self._serial_widget)
+
+        # SSH Tunnel sub-panel — kết nối tới enc-sensor-gateway khi máy
+        # không có đường mạng trực tiếp tới server (xem
+        # enc-docs/Ket-Noi-Tool-Test-Sensor-Gateway.md). Tự mở SSH local
+        # port-forward rồi kết nối TCP Client vào 127.0.0.1:<local_port>.
+        self._ssh_widget = QWidget()
+        ssh_form = QFormLayout(self._ssh_widget)
+        ssh_form.setContentsMargins(0, 0, 0, 0)
+
+        self._ssh_host = QLineEdit()
+        self._ssh_host.setPlaceholderText("vd: 171.244.197.133")
+        self._ssh_port = QSpinBox()
+        self._ssh_port.setRange(1, 65535)
+        self._ssh_port.setValue(2222)
+        self._ssh_user = QLineEdit("root")
+
+        pass_row = QHBoxLayout()
+        self._ssh_pass = QLineEdit()
+        self._ssh_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        self._ssh_remember_pass = QCheckBox("Nhớ mật khẩu")
+        self._ssh_remember_pass.setToolTip(
+            "Lưu mật khẩu vào ~/.maritime_simulator.json để lần sau tự điền sẵn"
+        )
+        pass_row.addWidget(self._ssh_pass, stretch=1)
+        pass_row.addWidget(self._ssh_remember_pass)
+
+        self._ssh_namespace = QLineEdit("enc-ship")
+        self._ssh_label_selector = QLineEdit("app=enc-sensor-gateway")
+
+        pod_row = QHBoxLayout()
+        self._ssh_pod_ip = QLineEdit()
+        self._ssh_pod_ip.setPlaceholderText("vd: 10.42.0.96")
+        self._btn_ssh_fetch_pod_ip = QPushButton("Lấy Pod IP")
+        self._btn_ssh_fetch_pod_ip.setToolTip(
+            "Chạy 'kubectl get pod' qua SSH để lấy IP hiện tại của pod\n"
+            "(đổi mỗi lần pod restart)"
+        )
+        pod_row.addWidget(self._ssh_pod_ip, stretch=1)
+        pod_row.addWidget(self._btn_ssh_fetch_pod_ip)
+
+        self._ssh_remote_port = QSpinBox()
+        self._ssh_remote_port.setRange(1, 65535)
+        self._ssh_remote_port.setValue(5001)
+        self._ssh_remote_port.setToolTip("Cổng thiết bị — lấy từ cột config của bảng device")
+
+        self._ssh_local_port = QSpinBox()
+        self._ssh_local_port.setRange(1, 65535)
+        self._ssh_local_port.setValue(5001)
+        self._ssh_local_port.setToolTip("Cổng local trên máy bạn, tool sẽ kết nối TCP Client vào 127.0.0.1:<cổng này>")
+
+        ssh_form.addRow("SSH Host:", self._ssh_host)
+        ssh_form.addRow("SSH Port:", self._ssh_port)
+        ssh_form.addRow("Username:", self._ssh_user)
+        ssh_form.addRow("Password:", pass_row)
+        ssh_form.addRow("k8s Namespace:", self._ssh_namespace)
+        ssh_form.addRow("Pod Selector:", self._ssh_label_selector)
+        ssh_form.addRow("Pod IP:", pod_row)
+        ssh_form.addRow("Cổng thiết bị:", self._ssh_remote_port)
+        ssh_form.addRow("Cổng local:", self._ssh_local_port)
+
+        self._ssh_widget.setVisible(False)
+        layout.addWidget(self._ssh_widget)
+        self._load_ssh_settings()
 
         # Connect / Disconnect
         conn_row = QHBoxLayout()
@@ -340,12 +451,12 @@ class MainWindow(QMainWindow):
         self._gps_lat = QDoubleSpinBox()
         self._gps_lat.setRange(-90.0, 90.0)
         self._gps_lat.setDecimals(6)
-        self._gps_lat.setValue(10.776900)
+        self._gps_lat.setValue(self._start_lat)
 
         self._gps_lon = QDoubleSpinBox()
         self._gps_lon.setRange(-180.0, 180.0)
         self._gps_lon.setDecimals(6)
-        self._gps_lon.setValue(106.700900)
+        self._gps_lon.setValue(self._start_lon)
 
         self._gps_speed = QDoubleSpinBox()
         self._gps_speed.setRange(0.0, 200.0)
@@ -427,12 +538,12 @@ class MainWindow(QMainWindow):
         self._rmb_dest_lat = QDoubleSpinBox()
         self._rmb_dest_lat.setRange(-90.0, 90.0)
         self._rmb_dest_lat.setDecimals(6)
-        self._rmb_dest_lat.setValue(10.776900)
+        self._rmb_dest_lat.setValue(self._start_lat)
 
         self._rmb_dest_lon = QDoubleSpinBox()
         self._rmb_dest_lon.setRange(-180.0, 180.0)
         self._rmb_dest_lon.setDecimals(6)
-        self._rmb_dest_lon.setValue(106.700900)
+        self._rmb_dest_lon.setValue(self._start_lon)
 
         self._rmb_xte = QDoubleSpinBox()
         self._rmb_xte.setRange(0.0, 9.99)
@@ -702,12 +813,12 @@ class MainWindow(QMainWindow):
         self._a_lat = QDoubleSpinBox()
         self._a_lat.setRange(-90.0, 90.0)
         self._a_lat.setDecimals(6)
-        self._a_lat.setValue(10.776900)
+        self._a_lat.setValue(self._start_lat)
 
         self._a_lon = QDoubleSpinBox()
         self._a_lon.setRange(-180.0, 180.0)
         self._a_lon.setDecimals(6)
-        self._a_lon.setValue(106.700900)
+        self._a_lon.setValue(self._start_lon)
 
         self._a_sog = QDoubleSpinBox()
         self._a_sog.setRange(0.0, 9999.0)
@@ -1134,9 +1245,13 @@ class MainWindow(QMainWindow):
         # Mode toggle
         self._rb_tcp.toggled.connect(self._on_mode_changed)
         self._rb_tcp_server.toggled.connect(self._on_mode_changed)
+        self._rb_ssh.toggled.connect(self._on_mode_changed)
 
         # Serial refresh
         self._btn_refresh.clicked.connect(self._refresh_ports)
+
+        # SSH Tunnel
+        self._btn_ssh_fetch_pod_ip.clicked.connect(self._on_ssh_fetch_pod_ip)
 
         # Connection
         self._btn_connect.clicked.connect(self._on_connect)
@@ -1258,6 +1373,7 @@ class MainWindow(QMainWindow):
         self._tcp_widget.setVisible(self._rb_tcp.isChecked())
         self._tcp_server_widget.setVisible(self._rb_tcp_server.isChecked())
         self._serial_widget.setVisible(self._rb_serial.isChecked())
+        self._ssh_widget.setVisible(self._rb_ssh.isChecked())
 
     def _refresh_ports(self) -> None:
         self._serial_port.clear()
@@ -1281,6 +1397,29 @@ class MainWindow(QMainWindow):
                 port = self._srv_port.value()
                 self._transmitter = TCPServerTransmitter(host, port)
                 label = f"TCP Server  {host}:{port}"
+            elif self._rb_ssh.isChecked():
+                ssh_host = self._ssh_host.text().strip()
+                pod_ip = self._ssh_pod_ip.text().strip()
+                if not ssh_host or not pod_ip:
+                    raise ValueError("Cần nhập SSH Host và Pod IP trước khi kết nối")
+                local_port = self._ssh_local_port.value()
+                tunnel = SSHTunnel(
+                    ssh_host=ssh_host,
+                    ssh_port=self._ssh_port.value(),
+                    ssh_username=self._ssh_user.text().strip(),
+                    ssh_password=self._ssh_pass.text(),
+                    remote_host=pod_ip,
+                    remote_port=self._ssh_remote_port.value(),
+                    local_port=local_port,
+                )
+                try:
+                    self._transmitter = TCPTransmitter("127.0.0.1", tunnel.local_port)
+                except Exception:
+                    tunnel.close()
+                    raise
+                self._ssh_tunnel = tunnel
+                label = f"SSH Tunnel  127.0.0.1:{tunnel.local_port}  →  {pod_ip}:{self._ssh_remote_port.value()}"
+                self._save_ssh_settings()
             else:
                 port_name = self._serial_port.currentText()
                 baud = int(self._serial_baud.currentText())
@@ -1304,11 +1443,75 @@ class MainWindow(QMainWindow):
         if self._transmitter:
             self._transmitter.close()
             self._transmitter = None
+        if self._ssh_tunnel:
+            self._ssh_tunnel.close()
+            self._ssh_tunnel = None
         self._btn_connect.setEnabled(True)
         self._btn_disconnect.setEnabled(False)
         self._btn_start.setEnabled(False)
         self.statusBar().showMessage("Disconnected")
         self._log_info("Disconnected")
+
+    def _load_ssh_settings(self) -> None:
+        """Điền sẵn panel SSH Tunnel từ ~/.maritime_simulator.json (nếu có),
+        hoặc giá trị mặc định (SSH Host = 171.244.197.133) nếu chưa từng lưu."""
+        cfg = ssh_settings.load()
+        self._ssh_host.setText(cfg["ssh_host"])
+        self._ssh_port.setValue(cfg["ssh_port"])
+        self._ssh_user.setText(cfg["ssh_user"])
+        self._ssh_namespace.setText(cfg["ssh_namespace"])
+        self._ssh_label_selector.setText(cfg["ssh_label_selector"])
+        self._ssh_pod_ip.setText(cfg["ssh_pod_ip"])
+        self._ssh_remote_port.setValue(cfg["ssh_remote_port"])
+        self._ssh_local_port.setValue(cfg["ssh_local_port"])
+        self._ssh_remember_pass.setChecked(cfg["ssh_remember_password"])
+        if cfg["ssh_remember_password"]:
+            self._ssh_pass.setText(cfg["ssh_password"])
+
+    def _save_ssh_settings(self) -> None:
+        """Lưu panel SSH Tunnel vào ~/.maritime_simulator.json sau khi kết
+        nối thành công lần đầu — mật khẩu chỉ lưu nếu tick 'Nhớ mật khẩu'."""
+        remember = self._ssh_remember_pass.isChecked()
+        cfg = {
+            "ssh_host": self._ssh_host.text().strip(),
+            "ssh_port": self._ssh_port.value(),
+            "ssh_user": self._ssh_user.text().strip(),
+            "ssh_password": self._ssh_pass.text() if remember else "",
+            "ssh_remember_password": remember,
+            "ssh_namespace": self._ssh_namespace.text().strip(),
+            "ssh_label_selector": self._ssh_label_selector.text().strip(),
+            "ssh_pod_ip": self._ssh_pod_ip.text().strip(),
+            "ssh_remote_port": self._ssh_remote_port.value(),
+            "ssh_local_port": self._ssh_local_port.value(),
+        }
+        try:
+            ssh_settings.save(cfg)
+        except Exception:
+            pass
+
+    def _on_ssh_fetch_pod_ip(self) -> None:
+        ssh_host = self._ssh_host.text().strip()
+        if not ssh_host:
+            QMessageBox.warning(self, "Thiếu thông tin", "Nhập SSH Host trước")
+            return
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        self._btn_ssh_fetch_pod_ip.setEnabled(False)
+        try:
+            pod_ip = fetch_pod_ip(
+                ssh_host=ssh_host,
+                ssh_port=self._ssh_port.value(),
+                ssh_username=self._ssh_user.text().strip(),
+                ssh_password=self._ssh_pass.text(),
+                namespace=self._ssh_namespace.text().strip(),
+                label_selector=self._ssh_label_selector.text().strip(),
+            )
+            self._ssh_pod_ip.setText(pod_ip)
+            self._log_info(f"Đã lấy Pod IP: {pod_ip}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Lấy Pod IP thất bại", str(exc))
+        finally:
+            self._btn_ssh_fetch_pod_ip.setEnabled(True)
+            self.unsetCursor()
 
     # Transmit control ----------------------------------------------------
 
@@ -1475,15 +1678,18 @@ class MainWindow(QMainWindow):
         import random
         count = self._r_auto_count.value()
         existing = set(self._radar_gen.targets.keys())
+        own_lat, own_lon = self._radar_gen.own_lat, self._radar_gen.own_lon
         for _ in range(count):
             tid = 1
             while tid in existing:
                 tid += 1
             existing.add(tid)
+            lat, lon = self._sample_near_own_ship(own_lat, own_lon, random.uniform(0.5, 15.0))
+            bearing, range_nm = _bearing_range(own_lat, own_lon, lat, lon)
             self._radar_gen.add_or_update_target(
                 target_id=tid,
-                bearing=round(random.uniform(0, 360), 1),
-                range_nm=round(random.uniform(0.5, 15.0), 2),
+                bearing=round(bearing, 1),
+                range_nm=round(max(range_nm, 0.05), 2),
                 speed=round(random.uniform(0, 20), 1),
                 course=round(random.uniform(0, 360), 1),
                 status='T',
@@ -1500,33 +1706,38 @@ class MainWindow(QMainWindow):
                       70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
                       80, 81, 82, 83, 84, 85, 86, 87, 88, 89}
 
-    # Vùng biển/cảng/sông Việt Nam thực tế
-    # (tên, lat, lon, bán_kính_NM, loại_vùng, trọng_số)
-    # loại: 'port' | 'sea' | 'river'
+    # Vùng biển/cảng/sông Việt Nam — dùng để sinh toạ độ luôn nằm trên mặt
+    # nước (không rơi lên đất liền).
+    # (tên, kind, lat1, lon1, lat2, lon2, size, loại_vùng, trọng_số)
+    #   kind='circle'   : vùng biển/vịnh mở — tròn bán kính `size` NM quanh
+    #                     (lat1, lon1); đủ rộng nên full-circle vẫn an toàn.
+    #   kind='corridor' : luồng/sông hẹp — dải NM `size` (nửa bề rộng) dọc
+    #                     theo đoạn thẳng xấp xỉ lòng sông/luồng từ
+    #                     (lat1, lon1) đến (lat2, lon2); tránh full-circle
+    #                     rơi lên bờ như cách sinh cũ.
+    # loại_vùng: 'port' | 'sea' | 'river' — quyết định loại tàu/tốc độ điển hình.
     _VIETNAM_ZONES = [
-        # ── Cảng biển lớn ──────────────────────────────────────────────────
-        ('Cảng Hải Phòng',       20.867, 106.683, 4.0,  'port',  10),
-        ('Cảng Cửa Lò (Vinh)',   18.800, 105.717, 2.5,  'port',   5),
-        ('Cảng Đà Nẵng',         16.067, 108.217, 3.0,  'port',   8),
-        ('Cảng Dung Quất',       15.400, 108.767, 2.5,  'port',   5),
-        ('Cảng Quy Nhơn',        13.767, 109.217, 2.5,  'port',   6),
-        ('Cảng Nha Trang',       12.233, 109.183, 2.0,  'port',   5),
-        ('Cảng Vũng Tàu',        10.350, 107.067, 5.0,  'port',   9),
-        ('Cảng Cát Lái (HCM)',   10.733, 106.733, 3.0,  'port',  12),
-        ('Cảng Cần Thơ',         10.050, 105.783, 2.0,  'port',   6),
-        # ── Tuyến biển ─────────────────────────────────────────────────────
-        ('Vịnh Bắc Bộ',          19.500, 107.500, 55.0, 'sea',    9),
-        ('Ven biển Trung Bộ',    15.000, 109.500, 60.0, 'sea',    8),
-        ('Ven biển Nam Trung Bộ',12.000, 110.000, 55.0, 'sea',    8),
-        ('Biển Đông (Nam)',        9.500, 110.000, 60.0, 'sea',    7),
-        ('Vịnh Thái Lan',         9.500, 103.500, 40.0, 'sea',    6),
-        ('Quần đảo Trường Sa',    9.000, 113.000, 50.0, 'sea',    3),
-        # ── Sông, vùng cửa sông ────────────────────────────────────────────
-        ('Sông Sài Gòn',         10.800, 106.720,  0.6, 'river',  7),
-        ('Sông Tiền / Sông Hậu', 10.100, 106.000,  4.0, 'river',  8),
-        ('Cửa sông Mekong',       9.600, 106.200,  3.0, 'river',  6),
-        ('Sông Hồng / Hải Phòng',20.600, 106.300,  5.0, 'river',  6),
-        ('Phá Tam Giang (Huế)',  16.500, 107.600,  2.0, 'river',  3),
+        # ── Biển / vịnh mở (circle) ──────────────────────────────────────
+        ('Vịnh Bắc Bộ',              'circle', 19.700, 107.500, None, None, 45.0, 'sea', 9),
+        ('Ven biển Trung Bộ',        'circle', 15.300, 109.800, None, None, 45.0, 'sea', 8),
+        ('Ven biển Nam Trung Bộ',    'circle', 12.300, 110.300, None, None, 45.0, 'sea', 8),
+        ('Biển Đông (Nam)',          'circle',  9.500, 110.500, None, None, 55.0, 'sea', 7),
+        ('Vịnh Thái Lan',            'circle',  9.300, 103.800, None, None, 35.0, 'sea', 6),
+        ('Quần đảo Trường Sa',       'circle',  9.000, 113.000, None, None, 45.0, 'sea', 3),
+        ('Vịnh Đà Nẵng (ngoài khơi)','circle', 16.150, 108.260, None, None,  1.5, 'sea', 5),
+        ('Vịnh Nha Trang (ngoài khơi)','circle',12.190, 109.260, None, None,  1.8, 'sea', 5),
+        ('Vịnh Quy Nhơn (ngoài khơi)','circle', 13.740, 109.300, None, None,  1.5, 'sea', 4),
+        ('Vũng neo Vũng Tàu',        'circle', 10.300, 107.200, None, None,  3.0, 'sea', 9),
+        ('Cửa Mekong (ngoài khơi)',  'circle',  9.450, 106.750, None, None,  4.0, 'sea', 5),
+        ('Vịnh Hạ Long (mở)',        'circle', 20.900, 107.150, None, None,  3.0, 'sea', 6),
+        # ── Luồng cảng / sông hẹp (corridor) ─────────────────────────────
+        ('Sông Sài Gòn (nội đô)',    'corridor', 10.7820, 106.7040, 10.7550, 106.7430, 0.25, 'river', 6),
+        ('Sông Sài Gòn (Cát Lái)',   'corridor', 10.7550, 106.7430, 10.7150, 106.7900, 0.35, 'port', 10),
+        ('Luồng Cái Mép - Thị Vải',  'corridor', 10.5800, 107.0150, 10.4300, 107.0300, 0.60, 'port', 10),
+        ('Sông Hậu (Cần Thơ)',       'corridor', 10.0700, 105.7300,  9.9600, 105.8500, 0.50, 'river', 6),
+        ('Sông Tiền (Mỹ Tho)',       'corridor', 10.3600, 106.3400, 10.2000, 106.5600, 0.40, 'river', 5),
+        ('Luồng Hải Phòng (Bạch Đằng)','corridor', 20.8700, 106.8000, 20.7500, 106.9600, 0.60, 'port', 10),
+        ('Sông Cấm (Hải Phòng)',     'corridor', 20.9000, 106.6500, 20.8500, 106.7500, 0.35, 'river', 5),
     ]
 
     # Tàu phù hợp theo loại vùng
@@ -1536,18 +1747,68 @@ class MainWindow(QMainWindow):
         'river': [30, 36, 37, 52, 90],
     }
 
+    def _random_own_ship_start(self) -> tuple:
+        """Chọn vị trí xuất phát ngẫu nhiên cho tàu mình — ưu tiên các
+        cảng/sông Việt Nam, thỉnh thoảng ở ngoài khơi. Thay cho toạ độ cố
+        định cũ (nằm trên đất liền giữa TP.HCM)."""
+        import random
+        port_zones = [z for z in self._VIETNAM_ZONES if z[7] in ('port', 'river')]
+        sea_zones = [z for z in self._VIETNAM_ZONES if z[7] == 'sea']
+        zones = port_zones if random.random() < 0.75 else sea_zones
+        weights = [z[8] for z in zones]
+        zone = random.choices(zones, weights=weights, k=1)[0]
+        lat, lon = _sample_zone_point(zone)
+        return round(lat, 6), round(lon, 6)
+
+    def _nearest_water_zone(self, lat: float, lon: float):
+        """Trả về zone (trong _VIETNAM_ZONES) có điểm tham chiếu gần
+        (lat, lon) nhất — dùng để sinh mục tiêu Radar/AIS "quanh tàu mình"
+        bám theo đúng vùng nước tàu mình đang ở, tránh rơi lên bờ."""
+        best, best_d = None, float('inf')
+        for zone in self._VIETNAM_ZONES:
+            _, kind, lat1, lon1, lat2, lon2, *_rest = zone
+            if kind == 'circle':
+                ref_lat, ref_lon = lat1, lon1
+            else:
+                ref_lat, ref_lon = (lat1 + lat2) / 2.0, (lon1 + lon2) / 2.0
+            _, d = _bearing_range(lat, lon, ref_lat, ref_lon)
+            if d < best_d:
+                best_d, best = d, zone
+        return best
+
+    def _sample_near_own_ship(self, own_lat: float, own_lon: float, range_nm: float) -> tuple:
+        """Sinh 1 điểm cách tàu mình khoảng `range_nm` NM, bám theo vùng
+        nước (biển mở / luồng / sông) gần tàu mình nhất — mục tiêu Radar/AIS
+        "quanh tàu mình" luôn nằm trên mặt nước thay vì rơi lên bờ."""
+        import random
+        zone = self._nearest_water_zone(own_lat, own_lon)
+        if zone is None or zone[1] == 'circle':
+            bearing = random.uniform(0, 360)
+            return _latlon_from_bearing_range(own_lat, own_lon, bearing, range_nm)
+
+        # corridor: rải trong 1 dải hình chữ nhật quanh VỊ TRÍ TÀU MÌNH, dọc
+        # theo trục sông/luồng (không phải từ đầu đoạn zone — trước đây tính
+        # từ đầu đoạn rồi clamp vào [0, length_nm] khiến hầu hết mục tiêu bị
+        # dồn về đúng 1 điểm đầu/cuối đoạn). Thành phần dọc trục lấy ngẫu
+        # nhiên trong [-range_nm, range_nm] thay vì cố định đúng range_nm —
+        # nếu không, mọi mục tiêu chỉ rơi vào đúng 2 tia (trước/sau tàu
+        # mình), nhìn như nằm thẳng hàng trên 1 đường thẳng.
+        _, _kind, lat1, lon1, lat2, lon2, half_width, _z_type, _w = zone
+        axis_brg, _length_nm = _bearing_range(lat1, lon1, lat2, lon2)
+        along = random.uniform(-range_nm, range_nm)
+        perp = random.uniform(-half_width, half_width)
+        lat_c, lon_c = _move(own_lat, own_lon, axis_brg, along, 1.0)
+        perp_brg = (axis_brg + 90.0) % 360
+        return _move(lat_c, lon_c, perp_brg, perp, 1.0)
+
     def _random_vietnam_vessel(self) -> dict:
         """Tạo một tàu tại vị trí thực tế ở vùng biển Việt Nam."""
         import random
         zones = self._VIETNAM_ZONES
-        weights = [z[5] for z in zones]
+        weights = [z[8] for z in zones]
         zone = random.choices(zones, weights=weights, k=1)[0]
-        _, z_lat, z_lon, radius, z_type, _ = zone
-
-        # Vị trí ngẫu nhiên trong bán kính vùng (phân bố tròn)
-        bearing = random.uniform(0, 360)
-        range_nm = random.uniform(0, radius)
-        lat, lon = _latlon_from_bearing_range(z_lat, z_lon, bearing, range_nm)
+        z_type = zone[7]
+        lat, lon = _sample_zone_point(zone)
 
         ship_type = random.choice(self._ZONE_SHIP_TYPES[z_type])
         ais_class = 'A' if ship_type in self._CLASS_A_TYPES else 'B'
@@ -1628,9 +1889,8 @@ class MainWindow(QMainWindow):
                 shiptype = random.choice(ship_types)
                 ais_class = 'A' if shiptype in self._CLASS_A_TYPES else 'B'
                 mmsi = self._new_mmsi(mid=0)
-                bearing = random.uniform(0, 360)
-                lat, lon = _latlon_from_bearing_range(
-                    self._gps_gen.lat, self._gps_gen.lon, bearing, range_nm
+                lat, lon = self._sample_near_own_ship(
+                    self._gps_gen.lat, self._gps_gen.lon, range_nm
                 )
                 cog = round(random.uniform(0, 360), 1)
                 heading = int(cog) % 360 if sog > 0.5 else 511
@@ -2045,11 +2305,15 @@ class MainWindow(QMainWindow):
 
         for i in range(fused_count):
             mmsi = self._new_mmsi()
-            bearing = round(random.uniform(0, 360), 1)
-            range_nm = round(random.uniform(0.5, 10.0), 2)
             speed = round(random.uniform(2, 18), 1)
             course = round(random.uniform(0, 360), 1)
             name = f'FUS{i + 1:02d}'
+
+            lat, lon = self._sample_near_own_ship(
+                self._gps_gen.lat, self._gps_gen.lon, random.uniform(0.5, 10.0)
+            )
+            bearing, range_nm = _bearing_range(self._gps_gen.lat, self._gps_gen.lon, lat, lon)
+            bearing, range_nm = round(bearing, 1), round(max(range_nm, 0.05), 2)
 
             self._radar_gen.add_or_update_target(
                 target_id=tid,
@@ -2059,9 +2323,6 @@ class MainWindow(QMainWindow):
                 course=course,
                 status='T',
                 name=name,
-            )
-            lat, lon = _latlon_from_bearing_range(
-                self._gps_gen.lat, self._gps_gen.lon, bearing, range_nm
             )
             # Fused vessels are large commercial ships → always Class A with IMO
             fused_shiptype = random.choice([70, 71, 72, 73, 74, 80, 81, 82, 83, 84])
@@ -2083,8 +2344,11 @@ class MainWindow(QMainWindow):
             tid += 1
 
         for i in range(radar_only_count):
-            bearing = round(random.uniform(0, 360), 1)
-            range_nm = round(random.uniform(0.5, 10.0), 2)
+            lat, lon = self._sample_near_own_ship(
+                self._gps_gen.lat, self._gps_gen.lon, random.uniform(0.5, 10.0)
+            )
+            bearing, range_nm = _bearing_range(self._gps_gen.lat, self._gps_gen.lon, lat, lon)
+            bearing, range_nm = round(bearing, 1), round(max(range_nm, 0.05), 2)
             speed = round(random.uniform(0, 20), 1)
             course = round(random.uniform(0, 360), 1)
             self._radar_gen.add_or_update_target(
@@ -2134,9 +2398,8 @@ class MainWindow(QMainWindow):
                     sog = round(random.uniform(10, 18), 1)
                     nav_status = 0
                 ao_class = 'A' if ao_shiptype in self._CLASS_A_TYPES else 'B'
-                bearing = random.uniform(0, 360)
-                lat, lon = _latlon_from_bearing_range(
-                    self._gps_gen.lat, self._gps_gen.lon, bearing, range_nm
+                lat, lon = self._sample_near_own_ship(
+                    self._gps_gen.lat, self._gps_gen.lon, range_nm
                 )
                 cog = round(random.uniform(0, 360), 1)
                 self._ais_gen.add_or_update_vessel(

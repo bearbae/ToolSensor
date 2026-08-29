@@ -195,6 +195,7 @@ class GPSGenerator:
         self.send_ths = False
         self.send_rmb = False
         self.send_vdo = False
+        self.send_vbw = False
 
         # RMB waypoint parameters
         self.rmb_origin_id = 'WP00'
@@ -242,6 +243,8 @@ class GPSGenerator:
             msgs.append(self._ths())
         if self.send_rmb:
             msgs.append(self._rmb())
+        if self.send_vbw:
+            msgs.append(self._vbw())
         if self.send_vdo:
             msgs.extend(self._vdo_sentences(now_t))
         return msgs
@@ -308,6 +311,15 @@ class GPSGenerator:
             f"{dest_lon_str},{dest_lon_dir},"
             f"{range_nm:.3f},{bearing:.1f},"
             f"{closing_vel:.1f},{arrival},A"
+        )
+        return f"${body}*{nmea_checksum(body)}"
+
+    def _vbw(self) -> str:
+        # No current/drift model → water speed mirrors ground speed; transverse
+        # components and stern-transducer fields are not simulated (marked void).
+        body = (
+            f"GPVBW,{self.speed:.1f},0.0,A,"
+            f"{self.speed:.1f},0.0,A,,V,,V"
         )
         return f"${body}*{nmea_checksum(body)}"
 

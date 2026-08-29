@@ -34,6 +34,25 @@ class TCPTransmitter:
             pass
 
 
+class UDPTransmitter:
+    """Sends NMEA sentences as UDP datagrams to a target host:port (unicast/broadcast)."""
+
+    def __init__(self, host: str, port: int, broadcast: bool = False):
+        self._addr = (host, port)
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if broadcast:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+    def send(self, data: str) -> None:
+        self._sock.sendto((data + '\r\n').encode('ascii'), self._addr)
+
+    def close(self) -> None:
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+
 class TCPServerTransmitter:
     """Listens as a TCP server; broadcasts NMEA sentences to all connected clients."""
 
