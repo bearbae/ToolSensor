@@ -196,6 +196,7 @@ class GPSGenerator:
         self.send_rmb = False
         self.send_vdo = False
         self.send_vbw = False
+        self.send_gga = False
 
         # RMB waypoint parameters
         self.rmb_origin_id = 'WP00'
@@ -245,6 +246,8 @@ class GPSGenerator:
             msgs.append(self._rmb())
         if self.send_vbw:
             msgs.append(self._vbw())
+        if self.send_gga:
+            msgs.append(self._gga(now))
         if self.send_vdo:
             msgs.extend(self._vdo_sentences(now_t))
         return msgs
@@ -268,6 +271,16 @@ class GPSGenerator:
         body = (
             f"GPZDA,{time_str},"
             f"{now.day:02d},{now.month:02d},{now.year:04d},00,00"
+        )
+        return f"${body}*{nmea_checksum(body)}"
+
+    def _gga(self, now: datetime.datetime) -> str:
+        time_str = now.strftime("%H%M%S.00")
+        lat_str, lat_dir = format_nmea_lat(self.lat)
+        lon_str, lon_dir = format_nmea_lon(self.lon)
+        body = (
+            f"GPGGA,{time_str},{lat_str},{lat_dir},{lon_str},{lon_dir},"
+            f"1,08,0.9,0.0,M,0.0,M,,"
         )
         return f"${body}*{nmea_checksum(body)}"
 

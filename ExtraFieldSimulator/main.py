@@ -1,7 +1,19 @@
-"""Maritime Signal Simulator — main entry point and UI."""
+"""Extra Field Simulator — Maritime Signal Simulator + cấu hình field EXTRA
+để test tính năng "Cấu hình bản tin" (DeviceFieldRule) của enc-sensor-gateway.
 
+Fork từ main.py gốc (tái dùng generators.py/transmitters.py/utils.py/
+gpx_parser.py ở thư mục cha) — xem SPEC_ExtraFieldSimulator.md và
+ARCHITECTURE_MaritimeSimulator.md ở gốc repo.
+"""
+
+import collections
 import os
 import sys
+
+# Cho phép import generators.py/transmitters.py/utils.py/gpx_parser.py/
+# ssh_settings.py/ssh_tunnel.py từ thư mục cha (đúng pattern NMEACollector/
+# NMEAReplay đang dùng).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PyQt6.QtCore import Qt, QDateTime, QTimer, pyqtSlot
 from PyQt6.QtGui import QFont, QIcon, QIntValidator
@@ -19,6 +31,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -97,6 +110,14 @@ from transmitters import (
     UDPTransmitter,
     list_serial_ports,
 )
+from extra_fields import (
+    SENTENCE_DEVICE_TYPE,
+    TARGET_SCOPED_SENTENCES,
+    ExtraFieldRule,
+    apply_extra_fields,
+    export_yaml,
+    import_yaml,
+)
 
 # ---------------------------------------------------------------------------
 # Colour scheme for the dark log console
@@ -153,10 +174,35 @@ QPushButton:disabled {
 """
 
 
+class _ExtraFieldSender:
+    """Bọc transmitter thật, chèn field EXTRA vào từng câu trước khi gửi —
+    để TransmitterThread (transmitters.py, giữ nguyên không sửa) không cần
+    biết gì về cấu hình EXTRA field.
+
+    TransmitterThread.run() emit tín hiệu message_sent bằng chuỗi GỐC (trước
+    khi qua send()), nên NMEA Log Console sẽ hiện sai nếu chỉ đọc thẳng
+    tín hiệu đó — self.sent_log ghi lại đúng chuỗi ĐÃ chèn field, theo đúng
+    thứ tự gửi (deque, 1 send() = 1 append), để _on_message_sent lấy ra
+    đúng chuỗi thật sự đã đi trên dây thay vì chuỗi gốc."""
+
+    def __init__(self, inner, get_rules) -> None:
+        self._inner = inner
+        self._get_rules = get_rules
+        self.sent_log: collections.deque = collections.deque()
+
+    def send(self, data: str) -> None:
+        out = apply_extra_fields(data, self._get_rules())
+        self.sent_log.append(out)
+        self._inner.send(out)
+
+    def close(self) -> None:
+        self._inner.close()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Maritime Signal Simulator")
+        self.setWindowTitle("Extra Field Simulator")
         self.setMinimumSize(1280, 780)
 
         # Vị trí xuất phát ngẫu nhiên cho tàu mình (cảng/sông VN, đôi khi
@@ -176,7 +222,9 @@ class MainWindow(QMainWindow):
         self._transmitter = None
         self._ssh_tunnel: SSHTunnel | None = None
         self._thread: TransmitterThread | None = None
+        self._extra_sender: _ExtraFieldSender | None = None
         self._fusion_entries: list = []
+        self._extra_rules: list[ExtraFieldRule] = []
 
         self._a_gpx_pending: list | None = None           # waypoints đang chờ gán cho vessel
         self._ais_vessel_routes: dict[int, list] = {}     # mmsi → waypoints
@@ -238,16 +286,19 @@ class MainWindow(QMainWindow):
         mode_row = QHBoxLayout()
         self._rb_tcp = QRadioButton("TCP Client")
         self._rb_tcp_server = QRadioButton("TCP Server")
+        self._rb_udp = QRadioButton("UDP")
         self._rb_serial = QRadioButton("Serial Port")
         self._rb_ssh = QRadioButton("SSH Tunnel")
         self._rb_tcp.setChecked(True)
         self._mode_grp = QButtonGroup(self)
         self._mode_grp.addButton(self._rb_tcp)
         self._mode_grp.addButton(self._rb_tcp_server)
+        self._mode_grp.addButton(self._rb_udp)
         self._mode_grp.addButton(self._rb_serial)
         self._mode_grp.addButton(self._rb_ssh)
         mode_row.addWidget(self._rb_tcp)
         mode_row.addWidget(self._rb_tcp_server)
+        mode_row.addWidget(self._rb_udp)
         mode_row.addWidget(self._rb_serial)
         mode_row.addWidget(self._rb_ssh)
         layout.addLayout(mode_row)
@@ -279,6 +330,22 @@ class MainWindow(QMainWindow):
         srv_form.addRow("", self._lbl_clients)
         self._tcp_server_widget.setVisible(False)
         layout.addWidget(self._tcp_server_widget)
+
+        # UDP sub-panel
+        self._udp_widget = QWidget()
+        udp_form = QFormLayout(self._udp_widget)
+        udp_form.setContentsMargins(0, 0, 0, 0)
+        self._udp_host = QLineEdit("127.0.0.1")
+        self._udp_host.setToolTip("Nhập 255.255.255.255 để broadcast toàn mạng LAN")
+        self._udp_port = QSpinBox()
+        self._udp_port.setRange(1, 65535)
+        self._udp_port.setValue(10110)
+        self._udp_broadcast = QCheckBox("Broadcast (bật SO_BROADCAST)")
+        udp_form.addRow("Host:", self._udp_host)
+        udp_form.addRow("Port:", self._udp_port)
+        udp_form.addRow("", self._udp_broadcast)
+        self._udp_widget.setVisible(False)
+        layout.addWidget(self._udp_widget)
 
         # Serial sub-panel
         self._serial_widget = QWidget()
@@ -438,7 +505,10 @@ class MainWindow(QMainWindow):
         self._chk_rot = QCheckBox("ROT")
         self._chk_ths = QCheckBox("THS")
         self._chk_rmb = QCheckBox("RMB")
-        for w in (self._chk_hdg, self._chk_rot, self._chk_ths, self._chk_rmb):
+        self._chk_vbw = QCheckBox("VBW")
+        self._chk_gga = QCheckBox("GGA")
+        for w in (self._chk_hdg, self._chk_rot, self._chk_ths, self._chk_rmb,
+                  self._chk_vbw, self._chk_gga):
             sent_row2.addWidget(w)
         sent_row2.addStretch()
 
@@ -991,8 +1061,162 @@ class MainWindow(QMainWindow):
         # ---- Fusion Test tab ---------------------------------------------
         tabs.addTab(self._build_fusion_tab(), "Fusion Test")
 
+        # ---- EXTRA Field tab -----------------------------------------------
+        tabs.addTab(self._build_extra_field_tab(), "EXTRA Field")
+
         layout.addWidget(tabs)
         return group
+
+    def _build_extra_field_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+
+        # ── Form nhập rule ───────────────────────────────────────────────
+        form = QFormLayout()
+
+        self._ef_sentence_type = QComboBox()
+        # Không mặc định chọn sẵn sentence nào — tránh gõ Field Index/Giá
+        # trị rồi Add mà quên đổi mục này, khiến rule bị gắn nhầm vào mục
+        # đầu danh sách một cách âm thầm.
+        self._ef_sentence_type.addItem("— Chọn sentence —", None)
+        for stype, dtype in SENTENCE_DEVICE_TYPE.items():
+            self._ef_sentence_type.addItem(f"{stype}  ({dtype})", stype)
+
+        self._ef_field_index = QSpinBox()
+        self._ef_field_index.setRange(0, 100)
+        self._ef_field_index.setToolTip(
+            "0-based, tính trên mảng field sau khi bỏ header talkerId+sentenceType.\n"
+            "Với VDM/VDO chỉ nên dùng 0–5 (phần wrapper) — không chèn được vào payload 6-bit."
+        )
+
+        # Chỉ hiện với TTM (nhiều target radar)/VDM (nhiều tàu AIS) — để
+        # trống thì rule áp dụng cho MỌI target (mặc định, giữ hành vi cũ);
+        # điền Target ID (TTM) hoặc MMSI (VDM) cụ thể thì chỉ ghi đè đúng
+        # target đó, các target khác vẫn nhận giá trị mặc định.
+        self._ef_target_key_label = QLabel("Target ID / MMSI:")
+        self._ef_target_key = QLineEdit()
+        self._ef_target_key.setPlaceholderText("Để trống = áp dụng mọi target (mặc định)")
+        self._ef_target_key.setToolTip(
+            "TTM: nhập Target ID (vd 1). VDM: nhập MMSI (vd 123456789).\n"
+            "Để trống → rule là mặc định, áp dụng cho mọi target/tàu chưa có rule riêng."
+        )
+
+        self._ef_field_name = QLineEdit()
+        self._ef_field_name.setPlaceholderText("VD: battery_voltage")
+
+        self._ef_action = QComboBox()
+        self._ef_action.addItems(["EXTRA", "DISABLE"])
+
+        self._ef_data_type = QComboBox()
+        self._ef_data_type.addItems(["STRING", "NUMBER", "BOOLEAN"])
+
+        self._ef_value_mode = QComboBox()
+
+        form.addRow("Sentence Type:", self._ef_sentence_type)
+        form.addRow(self._ef_target_key_label, self._ef_target_key)
+        form.addRow("Field Index:", self._ef_field_index)
+        form.addRow("Field Name:", self._ef_field_name)
+        form.addRow("Action:", self._ef_action)
+        form.addRow("Data Type:", self._ef_data_type)
+        form.addRow("Giá trị phát:", self._ef_value_mode)
+        layout.addLayout(form)
+
+        # ── Ô nhập giá trị — hiện/ẩn theo Data Type + Value Mode ─────────
+        self._ef_row_fixed_text = QWidget()
+        r = QHBoxLayout(self._ef_row_fixed_text)
+        r.setContentsMargins(0, 0, 0, 0)
+        self._ef_fixed_text = QLineEdit()
+        self._ef_fixed_text.setPlaceholderText("Giá trị cố định (text)")
+        r.addWidget(QLabel("Giá trị:"))
+        r.addWidget(self._ef_fixed_text, stretch=1)
+        layout.addWidget(self._ef_row_fixed_text)
+
+        self._ef_row_fixed_number = QWidget()
+        r = QHBoxLayout(self._ef_row_fixed_number)
+        r.setContentsMargins(0, 0, 0, 0)
+        self._ef_fixed_number = QDoubleSpinBox()
+        self._ef_fixed_number.setRange(-1_000_000.0, 1_000_000.0)
+        self._ef_fixed_number.setDecimals(3)
+        r.addWidget(QLabel("Giá trị:"))
+        r.addWidget(self._ef_fixed_number, stretch=1)
+        layout.addWidget(self._ef_row_fixed_number)
+
+        self._ef_row_range = QWidget()
+        r = QHBoxLayout(self._ef_row_range)
+        r.setContentsMargins(0, 0, 0, 0)
+        self._ef_range_min = QDoubleSpinBox()
+        self._ef_range_min.setRange(-1_000_000.0, 1_000_000.0)
+        self._ef_range_min.setDecimals(3)
+        self._ef_range_max = QDoubleSpinBox()
+        self._ef_range_max.setRange(-1_000_000.0, 1_000_000.0)
+        self._ef_range_max.setDecimals(3)
+        self._ef_range_max.setValue(100.0)
+        r.addWidget(QLabel("Từ:"))
+        r.addWidget(self._ef_range_min)
+        r.addWidget(QLabel("Đến:"))
+        r.addWidget(self._ef_range_max)
+        layout.addWidget(self._ef_row_range)
+
+        self._ef_row_increment = QWidget()
+        r = QHBoxLayout(self._ef_row_increment)
+        r.setContentsMargins(0, 0, 0, 0)
+        self._ef_inc_start = QDoubleSpinBox()
+        self._ef_inc_start.setRange(-1_000_000.0, 1_000_000.0)
+        self._ef_inc_start.setDecimals(3)
+        self._ef_inc_step = QDoubleSpinBox()
+        self._ef_inc_step.setRange(-1_000_000.0, 1_000_000.0)
+        self._ef_inc_step.setDecimals(3)
+        self._ef_inc_step.setValue(1.0)
+        r.addWidget(QLabel("Bắt đầu:"))
+        r.addWidget(self._ef_inc_start)
+        r.addWidget(QLabel("Bước tăng mỗi tick:"))
+        r.addWidget(self._ef_inc_step)
+        layout.addWidget(self._ef_row_increment)
+
+        self._ef_row_fixed_bool = QWidget()
+        r = QHBoxLayout(self._ef_row_fixed_bool)
+        r.setContentsMargins(0, 0, 0, 0)
+        self._ef_fixed_bool = QCheckBox("TRUE  (bỏ tick = FALSE)")
+        r.addWidget(self._ef_fixed_bool)
+        layout.addWidget(self._ef_row_fixed_bool)
+
+        # Add/Update + Remove
+        btn_row = QHBoxLayout()
+        self._btn_ef_add = QPushButton("Add / Update")
+        self._btn_ef_remove = QPushButton("Remove")
+        btn_row.addWidget(self._btn_ef_add)
+        btn_row.addWidget(self._btn_ef_remove)
+        layout.addLayout(btn_row)
+
+        self._ef_list = QListWidget()
+        self._ef_list.setMaximumHeight(140)
+        layout.addWidget(self._ef_list)
+
+        # Export / Import YAML
+        yaml_row = QHBoxLayout()
+        self._btn_ef_export = QPushButton("Export YAML")
+        self._btn_ef_import = QPushButton("Import YAML")
+        yaml_row.addWidget(self._btn_ef_export)
+        yaml_row.addWidget(self._btn_ef_import)
+        layout.addLayout(yaml_row)
+
+        layout.addStretch()
+
+        # Wiring nội bộ tab (đặt ở đây vì các widget vừa tạo)
+        self._ef_sentence_type.currentIndexChanged.connect(self._update_extra_target_key_visibility)
+        self._ef_action.currentTextChanged.connect(self._update_extra_value_widgets)
+        self._ef_data_type.currentTextChanged.connect(self._on_extra_data_type_changed)
+        self._ef_value_mode.currentTextChanged.connect(self._update_extra_value_widgets)
+        self._btn_ef_add.clicked.connect(self._on_extra_add)
+        self._btn_ef_remove.clicked.connect(self._on_extra_remove)
+        self._ef_list.itemClicked.connect(self._on_extra_item_clicked)
+        self._btn_ef_export.clicked.connect(self._on_extra_export)
+        self._btn_ef_import.clicked.connect(self._on_extra_import)
+
+        self._on_extra_data_type_changed(self._ef_data_type.currentText())
+        self._update_extra_target_key_visibility()
+        return tab
 
     def _build_fusion_tab(self) -> QWidget:
         tab = QWidget()
@@ -1245,6 +1469,7 @@ class MainWindow(QMainWindow):
         # Mode toggle
         self._rb_tcp.toggled.connect(self._on_mode_changed)
         self._rb_tcp_server.toggled.connect(self._on_mode_changed)
+        self._rb_udp.toggled.connect(self._on_mode_changed)
         self._rb_ssh.toggled.connect(self._on_mode_changed)
 
         # Serial refresh
@@ -1291,6 +1516,8 @@ class MainWindow(QMainWindow):
         self._chk_ths.toggled.connect(lambda v: setattr(self._gps_gen, 'send_ths', v))
         self._chk_rmb.toggled.connect(self._rmb_grp.setVisible)
         self._chk_rmb.toggled.connect(lambda v: setattr(self._gps_gen, 'send_rmb', v))
+        self._chk_vbw.toggled.connect(lambda v: setattr(self._gps_gen, 'send_vbw', v))
+        self._chk_gga.toggled.connect(lambda v: setattr(self._gps_gen, 'send_gga', v))
         self._chk_vdo.toggled.connect(lambda v: setattr(self._gps_gen, 'send_vdo', v))
         self._vdo_mmsi.textChanged.connect(
             lambda v: setattr(self._gps_gen, 'vdo_mmsi', int(v)) if v.isdigit() else None
@@ -1372,6 +1599,7 @@ class MainWindow(QMainWindow):
     def _on_mode_changed(self) -> None:
         self._tcp_widget.setVisible(self._rb_tcp.isChecked())
         self._tcp_server_widget.setVisible(self._rb_tcp_server.isChecked())
+        self._udp_widget.setVisible(self._rb_udp.isChecked())
         self._serial_widget.setVisible(self._rb_serial.isChecked())
         self._ssh_widget.setVisible(self._rb_ssh.isChecked())
 
@@ -1397,6 +1625,11 @@ class MainWindow(QMainWindow):
                 port = self._srv_port.value()
                 self._transmitter = TCPServerTransmitter(host, port)
                 label = f"TCP Server  {host}:{port}"
+            elif self._rb_udp.isChecked():
+                host = self._udp_host.text().strip()
+                port = self._udp_port.value()
+                self._transmitter = UDPTransmitter(host, port, broadcast=self._udp_broadcast.isChecked())
+                label = f"UDP  {host}:{port}"
             elif self._rb_ssh.isChecked():
                 ssh_host = self._ssh_host.text().strip()
                 pod_ip = self._ssh_pod_ip.text().strip()
@@ -1524,7 +1757,8 @@ class MainWindow(QMainWindow):
         ais = self._ais_gen if self._chk_ais.isChecked() else None
 
         self._msg_count = 0
-        self._thread = TransmitterThread(self._transmitter, gps, radar, ais, interval)
+        self._extra_sender = _ExtraFieldSender(self._transmitter, lambda: self._extra_rules)
+        self._thread = TransmitterThread(self._extra_sender, gps, radar, ais, interval)
         self._thread.message_sent.connect(self._on_message_sent)
         self._thread.error_occurred.connect(self._on_error)
         self._thread.start()
@@ -1546,6 +1780,12 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str)
     def _on_message_sent(self, msg: str) -> None:
+        # `msg` là chuỗi GỐC trước khi qua field EXTRA (TransmitterThread ở
+        # transmitters.py emit thẳng biến cục bộ, không biết _ExtraFieldSender
+        # đã biến đổi gì) — lấy đúng chuỗi ĐÃ gửi từ hàng đợi để log không bị
+        # sai lệch với dữ liệu thật sự đi trên dây.
+        if self._extra_sender and self._extra_sender.sent_log:
+            msg = self._extra_sender.sent_log.popleft()
         ts = QDateTime.currentDateTime().toString("HH:mm:ss.zzz")
         if "GPRMC" in msg:
             colour = _COL_GPS
@@ -1633,6 +1873,220 @@ class MainWindow(QMainWindow):
         else:
             eta = (0, 0, 24, 60)
         self._gps_gen.vdo_eta = eta
+
+    # EXTRA Field management ------------------------------------------------
+
+    _EF_MODE_MAP = {
+        ('STRING', 'Cố định'): 'fixed',
+        ('NUMBER', 'Cố định'): 'fixed',
+        ('NUMBER', 'Ngẫu nhiên trong khoảng'): 'random_range',
+        ('NUMBER', 'Tăng dần mỗi tick'): 'increment',
+        ('BOOLEAN', 'Cố định'): 'fixed',
+        ('BOOLEAN', 'Ngẫu nhiên'): 'random_bool',
+    }
+
+    def _update_extra_target_key_visibility(self, *_args) -> None:
+        stype = self._ef_sentence_type.currentData()
+        show = stype in TARGET_SCOPED_SENTENCES
+        self._ef_target_key_label.setVisible(show)
+        self._ef_target_key.setVisible(show)
+        if not show:
+            self._ef_target_key.clear()
+
+    def _normalize_target_key(self, stype: str, text: str) -> str:
+        text = text.strip()
+        if not text:
+            return ''
+        if stype == 'TTM':
+            try:
+                return str(int(text))
+            except ValueError:
+                return text
+        return text  # VDM: MMSI — so sánh dạng chuỗi số, giữ nguyên
+
+    def _on_extra_data_type_changed(self, data_type: str) -> None:
+        self._ef_value_mode.blockSignals(True)
+        self._ef_value_mode.clear()
+        if data_type == 'STRING':
+            self._ef_value_mode.addItems(["Cố định"])
+        elif data_type == 'NUMBER':
+            self._ef_value_mode.addItems(
+                ["Cố định", "Ngẫu nhiên trong khoảng", "Tăng dần mỗi tick"]
+            )
+        else:  # BOOLEAN
+            self._ef_value_mode.addItems(["Cố định", "Ngẫu nhiên"])
+        self._ef_value_mode.blockSignals(False)
+        self._update_extra_value_widgets()
+
+    def _update_extra_value_widgets(self, *_args) -> None:
+        is_extra = self._ef_action.currentText() == 'EXTRA'
+        self._ef_data_type.setEnabled(is_extra)
+        self._ef_value_mode.setEnabled(is_extra)
+
+        data_type = self._ef_data_type.currentText()
+        mode = self._ef_value_mode.currentText()
+
+        self._ef_row_fixed_text.setVisible(is_extra and data_type == 'STRING')
+        self._ef_row_fixed_number.setVisible(
+            is_extra and data_type == 'NUMBER' and mode == 'Cố định'
+        )
+        self._ef_row_range.setVisible(
+            is_extra and data_type == 'NUMBER' and mode == 'Ngẫu nhiên trong khoảng'
+        )
+        self._ef_row_increment.setVisible(
+            is_extra and data_type == 'NUMBER' and mode == 'Tăng dần mỗi tick'
+        )
+        self._ef_row_fixed_bool.setVisible(
+            is_extra and data_type == 'BOOLEAN' and mode == 'Cố định'
+        )
+
+    def _on_extra_add(self) -> None:
+        stype = self._ef_sentence_type.currentData()
+        if not stype:
+            QMessageBox.warning(
+                self, "Thiếu Sentence Type",
+                "Chưa chọn Sentence Type — chọn 1 sentence cụ thể (vd GGA) trước khi Add/Update."
+            )
+            return
+        action = self._ef_action.currentText()
+        data_type = self._ef_data_type.currentText()
+        mode_label = self._ef_value_mode.currentText()
+        value_mode = self._EF_MODE_MAP.get((data_type, mode_label), 'fixed')
+        target_key = (
+            self._normalize_target_key(stype, self._ef_target_key.text())
+            if stype in TARGET_SCOPED_SENTENCES else ''
+        )
+
+        rule = ExtraFieldRule(
+            sentence_type=stype,
+            field_index=self._ef_field_index.value(),
+            field_name=self._ef_field_name.text().strip(),
+            data_type=data_type,
+            action=action,
+            value_mode=value_mode,
+            target_key=target_key,
+        )
+        if data_type == 'STRING':
+            rule.fixed_value = self._ef_fixed_text.text()
+        elif data_type == 'NUMBER':
+            if value_mode == 'random_range':
+                rule.range_min = self._ef_range_min.value()
+                rule.range_max = self._ef_range_max.value()
+            elif value_mode == 'increment':
+                rule.range_min = self._ef_inc_start.value()
+                rule.step = self._ef_inc_step.value()
+            else:
+                rule.fixed_value = f"{self._ef_fixed_number.value():g}"
+        elif data_type == 'BOOLEAN' and value_mode == 'fixed':
+            rule.fixed_value = '1' if self._ef_fixed_bool.isChecked() else '0'
+
+        # Upsert theo (sentence_type, field_index, target_key) — target_key
+        # rỗng (mặc định) và target_key cụ thể là 2 rule độc lập, không đè
+        # nhau, dù cùng sentence_type + field_index.
+        self._extra_rules = [
+            r for r in self._extra_rules
+            if not (
+                r.sentence_type == rule.sentence_type
+                and r.field_index == rule.field_index
+                and r.target_key == rule.target_key
+            )
+        ]
+        self._extra_rules.append(rule)
+        self._refresh_extra_list()
+        target_desc = f"target={target_key}" if target_key else "mặc định (mọi target)"
+        self._log_info(f"Đã lưu rule {action}: {stype} #{rule.field_index} [{target_desc}] {rule.field_name}")
+
+    def _on_extra_remove(self) -> None:
+        items = self._ef_list.selectedItems()
+        if not items:
+            return
+        rule = items[0].data(Qt.ItemDataRole.UserRole)
+        self._extra_rules = [r for r in self._extra_rules if r is not rule]
+        self._refresh_extra_list()
+
+    def _on_extra_item_clicked(self, item: QListWidgetItem) -> None:
+        rule: ExtraFieldRule = item.data(Qt.ItemDataRole.UserRole)
+        idx = self._ef_sentence_type.findData(rule.sentence_type)
+        if idx >= 0:
+            self._ef_sentence_type.setCurrentIndex(idx)
+        self._update_extra_target_key_visibility()
+        self._ef_target_key.setText(rule.target_key)
+        self._ef_field_index.setValue(rule.field_index)
+        self._ef_field_name.setText(rule.field_name)
+        self._ef_action.setCurrentText(rule.action)
+        self._ef_data_type.setCurrentText(rule.data_type)
+
+        mode_label = next(
+            (label for (dtype, label), mode in self._EF_MODE_MAP.items()
+             if dtype == rule.data_type and mode == rule.value_mode),
+            None,
+        )
+        if mode_label:
+            self._ef_value_mode.setCurrentText(mode_label)
+
+        if rule.data_type == 'STRING':
+            self._ef_fixed_text.setText(rule.fixed_value)
+        elif rule.data_type == 'NUMBER':
+            if rule.value_mode == 'random_range':
+                self._ef_range_min.setValue(rule.range_min)
+                self._ef_range_max.setValue(rule.range_max)
+            elif rule.value_mode == 'increment':
+                self._ef_inc_start.setValue(rule.range_min)
+                self._ef_inc_step.setValue(rule.step)
+            else:
+                try:
+                    self._ef_fixed_number.setValue(float(rule.fixed_value or 0))
+                except ValueError:
+                    pass
+        elif rule.data_type == 'BOOLEAN':
+            self._ef_fixed_bool.setChecked(rule.fixed_value == '1')
+
+    def _refresh_extra_list(self) -> None:
+        self._ef_list.clear()
+        for r in sorted(
+            self._extra_rules, key=lambda x: (x.device_type, x.sentence_type, x.field_index)
+        ):
+            target_tag = f"  [target={r.target_key}]" if r.target_key else ""
+            if r.action == 'DISABLE':
+                text = f"[{r.device_type}] {r.sentence_type} #{r.field_index}{target_tag}  DISABLE"
+            else:
+                text = (
+                    f"[{r.device_type}] {r.sentence_type} #{r.field_index}{target_tag}  "
+                    f"{r.field_name}  ({r.data_type}, {r.value_mode})"
+                )
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, r)
+            self._ef_list.addItem(item)
+
+    def _on_extra_export(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export YAML", "device_field_rules.yaml", "YAML (*.yaml *.yml)"
+        )
+        if not path:
+            return
+        # device_name không còn được ENC đọc (nút Import trên màn Device đã
+        # chọn sẵn thiết bị đích) — truyền dict rỗng, export_yaml tự điền
+        # device_type ("GPS"/"RADAR"/"AIS") làm placeholder cho có giá trị.
+        try:
+            n_exported = export_yaml(path, self._extra_rules, {})
+            n_total = len(self._extra_rules)
+            note = f" (gộp từ {n_total} rule nội bộ theo target)" if n_exported < n_total else ""
+            self._log_info(f"Đã export {n_exported} dòng ra {path}{note}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export thất bại", str(exc))
+
+    def _on_extra_import(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Import YAML", "", "YAML (*.yaml *.yml)")
+        if not path:
+            return
+        try:
+            rules, _device_names = import_yaml(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Import thất bại", str(exc))
+            return
+        self._extra_rules = rules
+        self._refresh_extra_list()
+        self._log_info(f"Đã import {len(rules)} rule từ {path}")
 
     def _on_radar_add(self) -> None:
         status_map = {
