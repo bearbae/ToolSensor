@@ -507,8 +507,9 @@ class MainWindow(QMainWindow):
         self._chk_rmb = QCheckBox("RMB")
         self._chk_vbw = QCheckBox("VBW")
         self._chk_gga = QCheckBox("GGA")
+        self._chk_vtg = QCheckBox("VTG")
         for w in (self._chk_hdg, self._chk_rot, self._chk_ths, self._chk_rmb,
-                  self._chk_vbw, self._chk_gga):
+                  self._chk_vbw, self._chk_gga, self._chk_vtg):
             sent_row2.addWidget(w)
         sent_row2.addStretch()
 
@@ -915,6 +916,15 @@ class MainWindow(QMainWindow):
             "15 – Not defined",
         ])
 
+        self._a_rot = QDoubleSpinBox()
+        self._a_rot.setRange(-720.0, 720.0)
+        self._a_rot.setDecimals(1)
+        self._a_rot.setSuffix(" °/min")
+        self._a_rot.setToolTip(
+            "Rate of Turn — chỉ áp dụng cho Class A (Type 1).\n"
+            "Positive = quay phải, Negative = quay trái. 0 = không quay."
+        )
+
         self._a_ais_class = QComboBox()
         self._a_ais_class.addItems(["Class A  (Type 1 + Type 5)", "Class B  (Type 18 + Type 24)"])
 
@@ -972,6 +982,7 @@ class MainWindow(QMainWindow):
         at_form.addRow("COG:", self._a_cog)
         at_form.addRow("Heading:", self._a_heading)
         at_form.addRow("Nav Status:", self._a_navstatus)
+        at_form.addRow("Rate of Turn:", self._a_rot)
         at_layout.addLayout(at_form)
 
         ab_row = QHBoxLayout()
@@ -1518,6 +1529,7 @@ class MainWindow(QMainWindow):
         self._chk_rmb.toggled.connect(lambda v: setattr(self._gps_gen, 'send_rmb', v))
         self._chk_vbw.toggled.connect(lambda v: setattr(self._gps_gen, 'send_vbw', v))
         self._chk_gga.toggled.connect(lambda v: setattr(self._gps_gen, 'send_gga', v))
+        self._chk_vtg.toggled.connect(lambda v: setattr(self._gps_gen, 'send_vtg', v))
         self._chk_vdo.toggled.connect(lambda v: setattr(self._gps_gen, 'send_vdo', v))
         self._vdo_mmsi.textChanged.connect(
             lambda v: setattr(self._gps_gen, 'vdo_mmsi', int(v)) if v.isdigit() else None
@@ -2419,6 +2431,7 @@ class MainWindow(QMainWindow):
             eta=eta,
             imo=self._a_imo.value() if ais_class == 'A' else 0,
             ais_class=ais_class,
+            rot=self._a_rot.value(),
         )
         if self._a_gpx_pending is not None:
             # User tải GPX mới tường minh → gán route + reset vị trí về đầu route
@@ -2484,6 +2497,7 @@ class MainWindow(QMainWindow):
         self._a_sog.setValue(v['sog'])
         self._a_cog.setValue(v['cog'])
         self._a_heading.setValue(v['heading'])
+        self._a_rot.setValue(v.get('rot', 0.0))
         self._a_shiptype.setValue(v.get('shiptype', 0))
         eta = v.get('eta', (0, 0, 24, 60))
         has_eta = eta != (0, 0, 24, 60)

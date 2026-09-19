@@ -32,6 +32,46 @@ Bộ 3 công cụ hỗ trợ thu thập, mô phỏng và phát lại dữ liệu
 3. Nhấn **Connect** → kết nối thành công thì nút **Start** sẽ sáng lên
 4. Nhấn **▶ Start** để bắt đầu phát, **■ Stop** để dừng
 
+### Kết nối tới `enc-sensor-gateway` khi máy không có đường mạng trực tiếp
+
+> Áp dụng khi bạn muốn dùng Simulator để bắn dữ liệu thử vào `enc-sensor-gateway`
+> đang chạy trên server tàu (`Ubuntu-614`), nhưng máy cá nhân **không cùng LAN**
+> với server — chỉ có Internet. Chi tiết đầy đủ xem
+> `enc-docs/Ket-Noi-Tool-Test-Sensor-Gateway.md`.
+
+`enc-sensor-gateway` chạy trong pod k3s, cổng nhận dữ liệu (TCP/UDP) được **mở
+động theo từng thiết bị** cấu hình trong bảng `device` — không có sẵn ở địa chỉ
+public `171.244.197.133`. Phải mở **SSH local port forwarding** để đi vòng qua:
+
+```powershell
+# Cửa sổ PowerShell riêng, giữ mở suốt lúc test:
+ssh -p 2222 -N -L 5001:<pod-ip>:<cổng-thiết-bị> root@171.244.197.133
+```
+
+- `<pod-ip>` lấy từ `kubectl -n enc-ship get pod -l app=enc-sensor-gateway -o jsonpath='{.items[0].status.podIP}'` (đổi mỗi lần pod restart, phải lấy lại)
+- `<cổng-thiết-bị>` lấy từ cột `config` của bảng `device` (khai qua UI admin)
+
+Sau khi tunnel chạy, mở Simulator và cấu hình:
+
+| Trường | Giá trị |
+| --- | --- |
+| Chế độ kết nối | **TCP Client** |
+| Host | `127.0.0.1` |
+| Port | cổng local đã chọn ở lệnh `-L` (vd: `5001`) |
+
+**Lưu ý quan trọng:**
+
+- Trên admin, thiết bị phải khai `connectionType = TCP_SERVER` (gateway mở
+  cổng, ngồi chờ) — đây là chế độ **duy nhất** dùng được qua SSH tunnel.
+  `TCP_CLIENT` không dùng được (gateway phải gọi ngược lại máy bạn, tunnel
+  không hỗ trợ chiều này); `UDP` cũng không forward được qua `ssh -L` chuẩn.
+- Simulator báo **Connect** thành công chỉ chứng minh tunnel nhận kết nối cục
+  bộ — không chắc đã thông tới tận pod. Kiểm chứng bằng log pod ngay lúc bấm
+  Connect: `kubectl -n enc-ship logs -f deploy/enc-sensor-gateway`, phải thấy
+  dòng `TCP client connected from /10.42.0.x:xxxxx`.
+- Cách này chỉ dùng để **test tay** — không phải giải pháp cho thiết bị thật
+  trên tàu (thiết bị thật đã cùng LAN với server, không cần tunnel).
+
 ### Cài đặt GPS
 
 | Trường                | Mô tả                               |

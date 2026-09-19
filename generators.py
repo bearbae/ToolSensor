@@ -14,6 +14,20 @@ from utils import nmea_checksum, format_nmea_lat, format_nmea_lon
 # Earth radius in nautical miles
 _R_NM = 3440.065
 
+
+def _rot_to_ais_code(rot_deg_per_min: float) -> int:
+    """Mã hoá Rate of Turn (độ/phút, +phải/-trái) sang field ROT 8-bit của
+    AIS Type 1/VDO theo ITU-R M.1371: ROT_ais = round(4.733 * sqrt(|ROT|)),
+    giữ dấu, giới hạn [-126, 126]; vượt ngưỡng (quay nhanh hơn mức đo được,
+    ~708°/phút) trả về ±127 ("đang quay gấp, không rõ tốc độ chính xác")."""
+    if not rot_deg_per_min:
+        return 0
+    sign = 1 if rot_deg_per_min > 0 else -1
+    magnitude = round(4.733 * math.sqrt(abs(rot_deg_per_min)))
+    if magnitude > 126:
+        return 127 * sign
+    return magnitude * sign
+
 # AIS 6-bit ASCII lookup: space=32, @=0, A-Z=1-26, 0-9=48-57
 _AIS_CHAR_MAP = {' ': 32, '@': 0}
 _AIS_CHAR_MAP.update({chr(i): i - ord('A') + 1 for i in range(ord('A'), ord('Z') + 1)})
@@ -197,6 +211,7 @@ class GPSGenerator:
         self.send_vdo = False
         self.send_vbw = False
         self.send_gga = False
+        self.send_vtg = False
 
         # RMB waypoint parameters
         self.rmb_origin_id = 'WP00'
@@ -248,6 +263,8 @@ class GPSGenerator:
             msgs.append(self._vbw())
         if self.send_gga:
             msgs.append(self._gga(now))
+        if self.send_vtg:
+            msgs.append(self._vtg())
         if self.send_vdo:
             msgs.extend(self._vdo_sentences(now_t))
         return msgs
@@ -281,6 +298,14 @@ class GPSGenerator:
         body = (
             f"GPGGA,{time_str},{lat_str},{lat_dir},{lon_str},{lon_dir},"
             f"1,08,0.9,0.0,M,0.0,M,,"
+        )
+        return f"${body}*{nmea_checksum(body)}"
+
+    def _vtg(self) -> str:
+        speed_kmh = self.speed * 1.852
+        body = (
+            f"GPVTG,{self.course:.1f},T,,M,"
+            f"{self.speed:.1f},N,{speed_kmh:.1f},K,A"
         )
         return f"${body}*{nmea_checksum(body)}"
 
@@ -364,7 +389,7 @@ class GPSGenerator:
             v &= (1 << n) - 1
             for i in range(n - 1, -1, -1): bits.append((v >> i) & 1)
         add_uint(1, 6); add_uint(0, 2); add_uint(self.vdo_mmsi, 30)
-        add_uint(self.vdo_nav_status, 4); add_int(-128, 8)
+        add_uint(self.vdo_nav_status, 4); add_int(_rot_to_ais_code(self.rate_of_turn), 8)
         add_uint(int(self.speed * 10), 10); add_uint(0, 1)
         add_int(round(self.lon * 600000), 28)
         add_int(round(self.lat * 600000), 27)
@@ -632,6 +657,7 @@ class AISGenerator:
         eta: tuple = (0, 0, 24, 60),   # (month, day, hour, minute) — 0/24/60 = n/a
         imo: int = 0,                  # IMO number 1000000–9999999; 0 = not available
         ais_class: str = 'A',          # 'A' → Type 1+5;  'B' → Type 18+24A+24B
+        rot: float = 0.0,              # degrees/minute, +right/-left (Type 1 only)
     ) -> None:
         existing = self.vessels.get(mmsi, {})
         # Keep current position when vessel is on a route (don't teleport it)
@@ -652,6 +678,7 @@ class AISGenerator:
             'eta': eta,
             'imo': imo,
             'ais_class': ais_class,
+            'rot': rot,
         }
         # Preserve route state, speed schedule, and static-message timing
         for key in ('_route', '_route_idx', '_route_loop', '_route_done',
@@ -744,7 +771,7 @@ class AISGenerator:
         add_uint(0, 2)                                          # Repeat
         add_uint(mmsi, 30)                                      # MMSI
         add_uint(vessel['nav_status'], 4)                       # Nav status
-        add_int(-128, 8)                                        # ROT (n/a)
+        add_int(_rot_to_ais_code(vessel.get('rot', 0.0)), 8)    # ROT
         add_uint(min(int(vessel['sog'] * 10), 1022), 10)        # SOG ×10, AIS max 102.2 kn
         add_uint(0, 1)                                          # Pos accuracy
         add_int(round(vessel['lon'] * 600000), 28)              # Lon (1/10000 min)

@@ -18,6 +18,7 @@ from utils import nmea_checksum
 SENTENCE_DEVICE_TYPE = {
     'RMC': 'GPS', 'ZDA': 'GPS', 'HDT': 'GPS', 'HDM': 'GPS', 'HDG': 'GPS',
     'ROT': 'GPS', 'THS': 'GPS', 'RMB': 'GPS', 'VBW': 'GPS', 'GGA': 'GPS',
+    'VTG': 'GPS',
     'TTM': 'RADAR', 'OSD': 'RADAR', 'RSD': 'RADAR',
     'VDM': 'AIS', 'VDO': 'AIS',
 }
