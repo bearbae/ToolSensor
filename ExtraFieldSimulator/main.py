@@ -42,6 +42,7 @@ from PyQt6.QtWidgets import (
 )
 
 from generators import AISGenerator, GPSGenerator, RadarTTMGenerator
+from utils import nmea_checksum
 from ssh_tunnel import SSHTunnel
 from transmitters import TCPServerTransmitter, TransmitterThread
 from extra_fields import ExtraFieldRule, apply_extra_fields
@@ -65,6 +66,18 @@ from ui_extra_field_tab import ExtraFieldTabMixin
 from vietnam_zones import ZoneHelperMixin
 
 
+def _corrupt_checksum(sentence: str) -> str:
+    """Thay '*hh' bằng checksum chắc chắn SAI (XOR đúng ^ 0x5A, luôn khác giá trị đúng) — để test
+    bộ nhận loại bỏ bản tin lỗi đường truyền. Câu không có '*' thì thêm checksum sai vào cuối."""
+    star = sentence.rfind('*')
+    if star < 0:
+        body, tail = sentence[1:], ''
+    else:
+        body, tail = sentence[1:star], sentence[star + 3:]
+    wrong = int(nmea_checksum(body), 16) ^ 0x5A
+    return f"{sentence[0]}{body}*{wrong:02X}{tail}"
+
+
 class _ExtraFieldSender:
     """Bọc transmitter thật, chèn field EXTRA vào từng câu trước khi gửi —
     để TransmitterThread (transmitters.py, giữ nguyên không sửa) không cần
@@ -76,14 +89,20 @@ class _ExtraFieldSender:
     thứ tự gửi (deque, 1 send() = 1 append), để _on_message_sent lấy ra
     đúng chuỗi thật sự đã đi trên dây thay vì chuỗi gốc."""
 
-    def __init__(self, inner, get_rules) -> None:
+    def __init__(self, inner, get_rules, is_bad_checksum=lambda: False) -> None:
         self._inner = inner
         self._get_rules = get_rules
+        # Đọc lại mỗi câu (không chốt lúc Start) → bật/tắt ô "sai checksum" có hiệu lực ngay khi đang phát.
+        self._is_bad_checksum = is_bad_checksum
+        # (chuỗi đã gửi, có bị làm sai checksum không)
         self.sent_log: collections.deque = collections.deque()
 
     def send(self, data: str) -> None:
         out = apply_extra_fields(data, self._get_rules())
-        self.sent_log.append(out)
+        bad = bool(self._is_bad_checksum())
+        if bad:
+            out = _corrupt_checksum(out)
+        self.sent_log.append((out, bad))
         self._inner.send(out)
 
     def close(self) -> None:
@@ -278,6 +297,7 @@ class MainWindow(
         self._chk_vbw.toggled.connect(lambda v: setattr(self._gps_gen, 'send_vbw', v))
         self._chk_gga.toggled.connect(lambda v: setattr(self._gps_gen, 'send_gga', v))
         self._chk_vtg.toggled.connect(lambda v: setattr(self._gps_gen, 'send_vtg', v))
+        self._chk_gll.toggled.connect(lambda v: setattr(self._gps_gen, 'send_gll', v))
         self._chk_vdo.toggled.connect(lambda v: setattr(self._gps_gen, 'send_vdo', v))
         self._vdo_mmsi.textChanged.connect(
             lambda v: setattr(self._gps_gen, 'vdo_mmsi', int(v)) if v.isdigit() else None
@@ -385,7 +405,11 @@ class MainWindow(
         ais = self._ais_gen if self._chk_ais.isChecked() else None
 
         self._msg_count = 0
-        self._extra_sender = _ExtraFieldSender(self._transmitter, lambda: self._extra_rules)
+        self._extra_sender = _ExtraFieldSender(
+            self._transmitter,
+            lambda: self._extra_rules,
+            lambda: self._chk_bad_checksum.isChecked(),
+        )
         self._thread = TransmitterThread(self._extra_sender, gps, radar, ais, interval)
         self._thread.message_sent.connect(self._on_message_sent)
         self._thread.error_occurred.connect(self._on_error)
@@ -412,8 +436,9 @@ class MainWindow(
         # transmitters.py emit thẳng biến cục bộ, không biết _ExtraFieldSender
         # đã biến đổi gì) — lấy đúng chuỗi ĐÃ gửi từ hàng đợi để log không bị
         # sai lệch với dữ liệu thật sự đi trên dây.
+        bad = False
         if self._extra_sender and self._extra_sender.sent_log:
-            msg = self._extra_sender.sent_log.popleft()
+            msg, bad = self._extra_sender.sent_log.popleft()
         ts = QDateTime.currentDateTime().toString("HH:mm:ss.zzz")
         if "GPRMC" in msg:
             colour = _COL_GPS
@@ -423,9 +448,10 @@ class MainWindow(
             colour = _COL_AIS
         else:
             colour = "#ffffff"
+        bad_tag = f'<span style="color:{_COL_ERROR};">[SAI CHECKSUM]</span>&nbsp;' if bad else ''
         self._log.append(
             f'<span style="color:{_COL_INFO};">[{ts}]</span>'
-            f'&nbsp;<span style="color:{colour};">{msg}</span>'
+            f'&nbsp;{bad_tag}<span style="color:{colour};">{msg}</span>'
         )
         if self._chk_scroll.isChecked():
             sb = self._log.verticalScrollBar()

@@ -212,6 +212,7 @@ class GPSGenerator:
         self.send_vbw = False
         self.send_gga = False
         self.send_vtg = False
+        self.send_gll = False
 
         # RMB waypoint parameters
         self.rmb_origin_id = 'WP00'
@@ -265,6 +266,8 @@ class GPSGenerator:
             msgs.append(self._gga(now))
         if self.send_vtg:
             msgs.append(self._vtg())
+        if self.send_gll:
+            msgs.append(self._gll(now))
         if self.send_vdo:
             msgs.extend(self._vdo_sentences(now_t))
         return msgs
@@ -299,6 +302,15 @@ class GPSGenerator:
             f"GPGGA,{time_str},{lat_str},{lat_dir},{lon_str},{lon_dir},"
             f"1,08,0.9,0.0,M,0.0,M,,"
         )
+        return f"${body}*{nmea_checksum(body)}"
+
+    def _gll(self, now: datetime.datetime) -> str:
+        """$GPGLL,llll.ll,a,yyyyy.yy,a,hhmmss.ss,A,A — vị trí địa lý (cùng vị trí/giờ với RMC, GGA).
+        Trạng thái 'A' (hợp lệ) + mode 'A' (autonomous, NMEA 2.3+)."""
+        time_str = now.strftime("%H%M%S.00")
+        lat_str, lat_dir = format_nmea_lat(self.lat)
+        lon_str, lon_dir = format_nmea_lon(self.lon)
+        body = f"GPGLL,{lat_str},{lat_dir},{lon_str},{lon_dir},{time_str},A,A"
         return f"${body}*{nmea_checksum(body)}"
 
     def _vtg(self) -> str:

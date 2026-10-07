@@ -45,6 +45,16 @@ class GPSPanelMixin:
         interval_row.addWidget(self._lbl_interval)
         layout.addLayout(interval_row)
 
+        # Bắn bản tin sai checksum — áp dụng cho MỌI câu (GPS/Radar/AIS), bật/tắt được khi đang phát.
+        self._chk_bad_checksum = QCheckBox("Bắn bản tin sai checksum")
+        self._chk_bad_checksum.setStyleSheet("color: #dc3545; font-weight: bold;")
+        self._chk_bad_checksum.setToolTip(
+            "Tích: mọi câu gửi đi đều có checksum (*hh) sai — không gửi câu hợp lệ nào.\n"
+            "Dùng để kiểm tra bên nhận kiểm checksum và loại bỏ bản tin lỗi đường truyền.\n"
+            "Bỏ tích: gửi bình thường."
+        )
+        layout.addWidget(self._chk_bad_checksum)
+
         # GPS settings
         gps_grp = QGroupBox("GPS Settings")
         gps_layout = QVBoxLayout(gps_grp)
@@ -55,9 +65,10 @@ class GPSPanelMixin:
         self._chk_zda = QCheckBox("ZDA")
         self._chk_hdt = QCheckBox("HDT")
         self._chk_hdm = QCheckBox("HDM")
+        self._chk_gll = QCheckBox("GLL")
         self._chk_rmc.setChecked(True)
         self._chk_zda.setChecked(True)
-        for w in (self._chk_rmc, self._chk_zda, self._chk_hdt, self._chk_hdm):
+        for w in (self._chk_rmc, self._chk_zda, self._chk_gll, self._chk_hdt, self._chk_hdm):
             sent_row1.addWidget(w)
         sent_row1.addStretch()
 
