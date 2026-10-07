@@ -3,6 +3,11 @@
 import os
 import sys
 
+# Cho phép import generators.py/transmitters.py/utils.py/gpx_parser.py/
+# ssh_settings.py/ssh_tunnel.py từ thư mục cha (module dùng chung với
+# ExtraFieldSimulator) — đúng pattern NMEACollector/NMEAReplay đang dùng.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from PyQt6.QtCore import Qt, QDateTime, QTimer, pyqtSlot
 from PyQt6.QtGui import QFont, QIcon, QIntValidator
 from PyQt6.QtWidgets import (

@@ -19,7 +19,7 @@ SENTENCE_DEVICE_TYPE = {
     'RMC': 'GPS', 'ZDA': 'GPS', 'HDT': 'GPS', 'HDM': 'GPS', 'HDG': 'GPS',
     'ROT': 'GPS', 'THS': 'GPS', 'RMB': 'GPS', 'VBW': 'GPS', 'GGA': 'GPS',
     'VTG': 'GPS',
-    'TTM': 'RADAR', 'OSD': 'RADAR', 'RSD': 'RADAR',
+    'TTM': 'RADAR', 'TLL': 'RADAR', 'OSD': 'RADAR', 'RSD': 'RADAR',
     'VDM': 'AIS', 'VDO': 'AIS',
 }
 
@@ -30,7 +30,7 @@ ACTIONS = ('EXTRA', 'DISABLE')
 # → mới có khái niệm "target_key" để phân biệt rule mặc định (mọi target)
 # với rule ghi đè cho đúng 1 target cụ thể. Các sentence GPS (RMC/GGA/...),
 # OSD/RSD, VDO chỉ có đúng 1 instance (tàu mình) nên không cần khái niệm này.
-TARGET_SCOPED_SENTENCES = ('TTM', 'VDM')
+TARGET_SCOPED_SENTENCES = ('TTM', 'TLL', 'VDM')
 
 
 @dataclass
@@ -99,7 +99,7 @@ def _decode_ais_mmsi(payload: str) -> str | None:
 def _extract_target_key(stype: str, fields: list[str]) -> str:
     """'' nếu sentence không có nhiều instance (xem TARGET_SCOPED_SENTENCES)
     hoặc không trích được — dùng để so khớp rule ghi đè theo từng target."""
-    if stype == 'TTM':
+    if stype in ('TTM', 'TLL'):   # cả 2 đều có Target ID ở field 0
         try:
             return str(int(fields[0]))
         except (ValueError, IndexError):

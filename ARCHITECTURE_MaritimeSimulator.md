@@ -1,21 +1,35 @@
 # Kiến trúc & luồng xây dựng — Maritime Signal Simulator
 
 > Tài liệu này mô tả cấu trúc code hiện tại của **Maritime Signal Simulator**
-> (`main.py` ở thư mục gốc repo) — công cụ tạo và phát bản tin NMEA giả lập.
-> Không bao gồm NMEA Collector / NMEA Replay (xem `README.md` cho tài liệu
-> người dùng của cả 3 tool).
+> (`MaritimeSimulator/main.py`) — công cụ tạo và phát bản tin NMEA giả lập.
+> Không bao gồm NMEA Collector / NMEA Replay / Extra Field Simulator (xem
+> `README.md` cho tài liệu người dùng của cả 4 tool).
 
 ## 1. Sơ đồ module
 
 ```
-main.py                 (~2500 dòng) — cửa sổ chính, toàn bộ UI (PyQt6) + điều phối
- ├─ generators.py        (906 dòng) — sinh câu NMEA: GPS / Radar / AIS
- ├─ transmitters.py       (203 dòng) — gửi câu NMEA ra ngoài: TCP / Serial / UDP
- ├─ gpx_parser.py                    — đọc waypoint từ file .gpx cho route AIS
- ├─ utils.py                         — checksum NMEA, format lat/lon
- ├─ ssh_settings.py                  — lưu/tải cấu hình SSH Tunnel (~/.maritime_simulator.json)
- └─ ssh_tunnel.py                    — SSH local port-forward (paramiko), fetch pod IP qua kubectl
+MaritimeSimulator/
+ ├─ main.py               (~2500 dòng) — cửa sổ chính, toàn bộ UI (PyQt6) + điều phối
+ ├─ icon.ico                          — icon riêng của tool này
+ ├─ _make_icon.py                     — script sinh icon.ico
+ └─ MaritimeSimulator.spec            — PyInstaller spec
+
+generators.py        (906 dòng) — sinh câu NMEA: GPS / Radar / AIS       ┐
+transmitters.py       (203 dòng) — gửi câu NMEA ra ngoài: TCP / Serial / UDP │ dùng chung ở
+gpx_parser.py                    — đọc waypoint từ file .gpx cho route AIS  │ thư mục gốc repo
+utils.py                         — checksum NMEA, format lat/lon           │ (cũng được
+ssh_settings.py                  — lưu/tải cấu hình SSH Tunnel             │ ExtraFieldSimulator
+ssh_tunnel.py                    — SSH local port-forward, fetch pod IP    ┘ import lại)
 ```
+
+`main.py` (và `icon.ico`/`_make_icon.py`/`.spec`) là file **riêng** của
+Maritime Signal Simulator, nằm trong thư mục `MaritimeSimulator/` — trước
+đây từng nằm thẳng ở thư mục gốc repo, đã dọn vào thư mục riêng cho đúng
+pattern với `NMEACollector/`, `NMEAReplay/`, `ExtraFieldSimulator/` (mỗi
+tool 1 thư mục). `main.py` tự thêm thư mục cha vào `sys.path` khi khởi động
+để import được các module dùng chung ở trên. Các module dùng chung đó vẫn ở
+gốc repo (không chuyển vào `MaritimeSimulator/`) vì `ExtraFieldSimulator`
+cũng cần chúng.
 
 Không có package ngoài nào chứa logic domain — `main.py` vừa là UI vừa là
 lớp điều phối (không tách riêng controller/service).
@@ -115,28 +129,30 @@ Chi tiết nghiệp vụ đã có trong `README.md`; về code:
 
 ## 6. Đóng gói (PyInstaller)
 
-Mỗi lần build ra `.exe` mới lại thêm một file `.spec` mới trong repo (lịch sử
-đặt tên theo version: `MaritimeV8.spec` … `MaritimeV13...spec`,
-`maritimeSimulatorV2.spec`, `maritimeSimulatorSSH.spec` — bản mới nhất có
-tích hợp SSH Tunnel). Cấu trúc `.spec` giống nhau, chỉ khác `name=`:
+Trước đây mỗi lần build lại thêm 1 file `.spec` mới đặt tên theo version
+(`MaritimeV3`…`MaritimeV13`, `maritimeSimulatorV2`, `maritimeSimulatorSSH`…
+— 16 file tích tụ theo lịch sử). Đã dọn về **đúng 1 file**
+`MaritimeSimulator/MaritimeSimulator.spec`, cùng pattern với
+`NMEACollector.spec`/`NMEAReplay.spec`/`ExtraFieldSimulator.spec`:
 
 ```python
-a = Analysis(['main.py'], pathex=['..'], ...)
-pyz = PYZ(a.pure)
-exe = EXE(pyz, ..., name='maritimeSimulatorSSH', console=False,
+a = Analysis(['main.py'], pathex=['..'], ...)   # '..' để Analysis tìm thấy
+pyz = PYZ(a.pure)                               # generators.py/transmitters.py/... ở gốc repo
+exe = EXE(pyz, ..., name='MaritimeSimulator', console=False,
           upx=True, icon=['icon.ico'])
 ```
 
 Build one-file, windowed (không console), icon `icon.ico` (tạo bằng
-`_make_icon.py`). Lệnh build:
+`_make_icon.py`). Lệnh build — chạy **từ trong thư mục `MaritimeSimulator/`**:
 
 ```powershell
-pyinstaller maritimeSimulatorSSH.spec
+cd MaritimeSimulator
+pyinstaller MaritimeSimulator.spec
 ```
 
-Output nằm ở `build/<name>/` (file trung gian) và `dist/<name>.exe` (file
-chạy cuối). Các `.spec`/`build`/`dist` cũ (V6–V13) là artefact của các lần
-build trước, chưa được dọn khỏi repo.
+Output nằm ở `MaritimeSimulator/build/` (file trung gian) và
+`MaritimeSimulator/dist/MaritimeSimulator.exe` (file chạy cuối) — cục bộ
+trong thư mục tool, không còn lẫn ở gốc repo với các tool khác.
 
 ## 7. Ghi chú về trạng thái hiện tại (chưa hoàn thiện)
 

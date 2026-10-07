@@ -536,6 +536,14 @@ class RadarTTMGenerator:
         self.osd_speed = 0.0
         self.osd_set = 0.0      # current set (degrees true)
         self.osd_drift = 0.0    # current drift (knots)
+        # Nguồn hướng đi / tốc độ (OSD field 3 / 5). Chuẩn NMEA: P=GPS, B=theo đáy,
+        # W=theo nước, R=bám mục tiêu radar, M=nhập tay. Mặc định giữ 'T'/'N' như
+        # trước để MaritimeSimulator phát y hệt cũ; ExtraFieldSimulator đặt 'P'.
+        self.osd_course_ref = 'T'
+        self.osd_speed_ref = 'N'
+
+        # TLL (Target Latitude and Longitude) — 1 câu/target, đi kèm TTM
+        self.send_tll = False
 
         # RSD (Radar System Data)
         self.send_rsd = False
@@ -546,6 +554,9 @@ class RadarTTMGenerator:
         self.rsd_range = 6.0
         self.rsd_cursor_range = 0.0
         self.rsd_cursor_bearing = 0.0
+        # Số chữ số thập phân của cự ly con trỏ — radar thật gửi tới 3 số lẻ (vd 0.044);
+        # mặc định 1 giữ định dạng cũ cho MaritimeSimulator.
+        self.rsd_cursor_decimals = 1
         self.rsd_rotation = 'N'   # N=North-up, H=Head-up, C=Course-up
 
     def add_or_update_target(
@@ -598,6 +609,8 @@ class RadarTTMGenerator:
                 f"{t['name']},{t['status']}"
             )
             messages.append(f"${body}*{nmea_checksum(body)}")
+            if self.send_tll:
+                messages.append(self._tll(tid, t))
 
         if self.send_osd:
             messages.append(self._osd())
@@ -605,11 +618,23 @@ class RadarTTMGenerator:
             messages.append(self._rsd())
         return messages
 
+    def _tll(self, tid, t: dict) -> str:
+        """$--TLL,xx,llll.ll,a,yyyyy.yy,a,name,hhmmss.ss,status,ref — vị trí
+        tuyệt đối (lat/lon) của target, cùng Target ID/tên/trạng thái với TTM."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        lat_str, lat_dir = format_nmea_lat(t['lat'])
+        lon_str, lon_dir = format_nmea_lon(t['lon'])
+        body = (
+            f"RATLL,{int(tid):02d},{lat_str},{lat_dir},{lon_str},{lon_dir},"
+            f"{t['name']},{now.strftime('%H%M%S.00')},{t['status']},"
+        )
+        return f"${body}*{nmea_checksum(body)}"
+
     def _osd(self) -> str:
         body = (
             f"RAOSD,{self.osd_heading:.1f},A,"
-            f"{self.osd_course:.1f},T,"
-            f"{self.osd_speed:.1f},N,"
+            f"{self.osd_course:.1f},{self.osd_course_ref},"
+            f"{self.osd_speed:.1f},{self.osd_speed_ref},"
             f"{self.osd_set:.1f},{self.osd_drift:.1f},N"
         )
         return f"${body}*{nmea_checksum(body)}"
@@ -618,7 +643,7 @@ class RadarTTMGenerator:
         body = (
             f"RARSD,0.0,0.0,{self.rsd_vrm1:.1f},{self.rsd_ebl1:.1f},"
             f"0.0,0.0,{self.rsd_vrm2:.1f},{self.rsd_ebl2:.1f},"
-            f"{self.rsd_cursor_range:.1f},{self.rsd_cursor_bearing:.1f},"
+            f"{self.rsd_cursor_range:.{self.rsd_cursor_decimals}f},{self.rsd_cursor_bearing:.1f},"
             f"{self.rsd_range:.1f},N,{self.rsd_rotation}"
         )
         return f"${body}*{nmea_checksum(body)}"
